@@ -2,6 +2,24 @@
 
 > **Note on Historical Entries:** Entries prior to the Tauri v2 refactor (including references to PySide6, `LucasChessGui.py`, `Debug.py`, and `Window*.py`) represent historical change logs from the pre-Tauri prototype and are preserved strictly for algorithmic and changelog history.
 
+## [RC-3] - September 8, 2026
+
+### [RC-3] SparView Pre-Flight UUID & Telemetry Concurrency Guard
+* **Epic / Domain:** Concurrency & Data Integrity (Sparring Micro-View)
+* **Status:** Resolved / Verified Clean
+* **Pass on First Attempt:** Yes (1 turn)
+* **Debug Iterations:** 0
+* **Target File:** `src/views/SparView.tsx`
+* **Verification:** `tsc --noEmit` exited 0; 7/7 surgical edits landed.
+* **Scope & Architectural Decisions:**
+  - Implemented 4-stage guard pattern in `handleStartGame()`.
+  - Enforced strict state invariant: `isGameActive(true)` and `triggerEngineMove()` are unreachable until a verified, non-empty `session.game.game_id` is committed.
+  - Guarded all 4 companion logging sites (`logKibitzerVariation` ×2, `logTutorFlag` ×2) against null/whitespace strings, eliminating foreign-key and orphaned record creation.
+  - Added additive `<p role="alert">` element without mutating existing board wrapper props or Tailwind layout structure.
+* **UX / System Impact:** Guarantees no phantom matches can be initiated on dropped engine handshakes and prevents UI state desync during rapid game start attempts.
+
+---
+
 ## [R6.0.6 - August 3, 2026]
 
 ### 🖥️ UX Modernization, Tiled Welcome Screen & Filter-Driven Analytics

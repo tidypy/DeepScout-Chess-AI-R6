@@ -167,6 +167,7 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
   const [game, setGame] = useState(new Chess());
   const [fen, setFen] = useState(game.fen());
   const [currentGameId, setCurrentGameId] = useState<string>("");
+  const [sparSessionError, setSparSessionError] = useState<string | null>(null);
   const [selectedEngine, setSelectedEngine] = useState("stockfish");
   const [selectedBook, setSelectedBook] = useState("GMopenings.bin");
   const [playerSide, setPlayerSide] = useState<"white" | "black">("white");
@@ -481,7 +482,7 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
         setKibitzerVariations(res.variations);
         logAction("API", "Fetched " + res.variations.length + " variations via " + engineToUse + " (Depth: " + (effectiveDepth || depthToUse) + ")");
 
-        if (kibitzerAutoSave && res.variations.length > 0) {
+        if (kibitzerAutoSave && res.variations.length > 0 && currentGameId?.trim()) {
           res.variations.forEach((v) => {
             logKibitzerVariation({
               game_id: currentGameId || "sparring-session-standalone",
@@ -507,8 +508,9 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
   // Kibitzer Save Variation to Kibitzer_Analysis.sqlite
   const handleSaveKibitzerVariation = async (variation: VariationLine) => {
     try {
+      if (!currentGameId?.trim()) return; // drop write: no verified session
       await logKibitzerVariation({
-        game_id: currentGameId || "sparring-session-standalone",
+        game_id: currentGameId,
         ply: moveRecords.length,
         fen: fen,
         engine: kibitzerEngineObj.name,
@@ -540,19 +542,23 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
     if (!activeTutorFlag) return;
     const flagCopy = { ...activeTutorFlag };
     try {
-      await logTutorFlag({
-        game_id: currentGameId || "sparring-session-standalone",
-        ply: flagCopy.ply || moveRecords.length,
-        fen: fen,
-        flag_type: flagCopy.flag_type,
-        engine: tutorEngineObj.name,
-        centipawn_data: { loss_cp: flagCopy.loss_cp, eval: flagCopy.eval_score },
-        suggested_variations: [{ san: flagCopy.best_move_san, tags: flagCopy.tags }],
-        tutor_outcome: outcome === "takeback" ? "ignored_flag" : outcome,
-        trigger_source: "flag_triggered",
-      });
-      logAction("API", "Tutor flag resolved with outcome: " + outcome);
-      queryClient.invalidateQueries({ queryKey: ["databases"] });
+      if (!currentGameId?.trim()) {
+        // No verified session — skip DB write, still process UI outcome below
+      } else {
+        await logTutorFlag({
+          game_id: currentGameId,
+          ply: flagCopy.ply || moveRecords.length,
+          fen: fen,
+          flag_type: flagCopy.flag_type,
+          engine: tutorEngineObj.name,
+          centipawn_data: { loss_cp: flagCopy.loss_cp, eval: flagCopy.eval_score },
+          suggested_variations: [{ san: flagCopy.best_move_san, tags: flagCopy.tags }],
+          tutor_outcome: outcome === "takeback" ? "ignored_flag" : outcome,
+          trigger_source: "flag_triggered",
+        });
+        logAction("API", "Tutor flag resolved with outcome: " + outcome);
+        queryClient.invalidateQueries({ queryKey: ["databases"] });
+      }
     } catch (err: any) {
       console.warn("Failed to log tutor flag outcome", err);
     }
@@ -750,29 +756,48 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
   };
 
   const handleStartGame = async () => {
+    // ── Stage 1: Reset all transient UI state before async work ──────────────
     const newG = new Chess();
     setGame(newG);
     setFen(newG.fen());
     setMoveHistory([]);
     setMoveRecords([]);
-    setIsGameActive(true);
     setEvalScore("+0.00");
     setSaveSuccessMsg(null);
     setAutosaveAlert(null);
     setActiveTutorFlag(null);
+    setSparSessionError(null);
+    // NOTE: setIsGameActive(true) is intentionally deferred to Stage 3
+    //       so the board is NOT interactive until game_id is verified.
 
+    // ── Stage 2: Pre-flight UUID verification gate ────────────────────────────
+    let verifiedGameId: string;
     try {
       const session = await createSparringGame({
         opponent_engine: currentEngineObj.name,
         user_time_control: "unlimited",
         tutor_interrupt_mode: tutorInterruptMode,
       });
-      if (session?.game?.game_id) {
-        setCurrentGameId(session.game.game_id);
+
+      const rawId = session?.game?.game_id;
+      if (!rawId || typeof rawId !== "string" || !rawId.trim()) {
+        // game_id absent, null, or blank — abort cleanly
+        setSparSessionError("Could not initialize sparring session: invalid game ID returned from server.");
+        logAction("ERROR", "handleStartGame aborted — createSparringGame returned no valid game_id");
+        return; // ← early return; triggerEngineMove never fires
       }
-    } catch (e) {
-      console.warn("Failed creating sparring session in DB:", e);
+
+      verifiedGameId = rawId.trim();
+    } catch (e: any) {
+      // createSparringGame rejected — surface error and abort
+      setSparSessionError("Failed to create sparring session: " + (e?.message ?? String(e)));
+      logAction("ERROR", "handleStartGame aborted — createSparringGame threw: " + (e?.message ?? String(e)));
+      return; // ← early return; triggerEngineMove never fires
     }
+
+    // ── Stage 3: Commit state only after UUID is verified ────────────────────
+    setCurrentGameId(verifiedGameId);
+    setIsGameActive(true); // board becomes interactive now
 
     logAction(
       "CLICK",
@@ -780,6 +805,7 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
       "Side: " + playerSide + ", Elo: " + targetElo + ", Engine: " + selectedEngine + ", Book: " + selectedBook
     );
 
+    // ── Stage 4: Engine / Kibitzer calls — guarded by verified game_id ───────
     if (playerSide === "black") {
       triggerEngineMove(newG.fen(), newG);
     } else if (kibitzerMode === "user_clock_bound" || kibitzerMode === "continuous") {
@@ -1035,8 +1061,9 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
                 // Pause play for user feedback - do not trigger opponent engine!
                 return;
               } else {
+                if (!currentGameId?.trim()) return; // drop write: no verified session
                 logTutorFlag({
-                  game_id: currentGameId || "sparring-session-standalone",
+                  game_id: currentGameId,
                   ply: currentPly,
                   fen: newFen,
                   flag_type: flagData.flag_type,
@@ -1626,6 +1653,12 @@ export function SparView({ uxTheme, boardTheme }: SparViewProps) {
               <ArrowUpDown className="w-4 h-4" />
             </button>
           </div>
+
+          {sparSessionError && (
+            <p className="w-full max-w-[520px] mt-1 text-xs text-red-400 font-medium" role="alert">
+              ⚠ {sparSessionError}
+            </p>
+          )}
 
           {/* Database Destinations Bar */}
           <div className={"w-full max-w-[520px] flex items-center justify-between text-xs font-mono pt-0.5 " + (isLight ? "text-slate-700" : "text-slate-300")}>
