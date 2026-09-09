@@ -1140,14 +1140,16 @@ class UCIEngineService:
                 raw_lines.append({
                     "pv_san": " ".join(pv_san_list),
                     "pv_uci": " ".join(pv_uci_list),
+                    "score": score_obj,
                     "score_cp": score_cp,
                     "is_mate": is_mate,
                     "mate_in": mate_in,
+                    "pv": pv_moves,
                     "depth": line_depth,
                     "nps": nps_val,
                 })
 
-            classified = classify_multipv(raw_lines)
+            classified = classify_multipv(board, raw_lines)
             return {
                 "variations": classified,
                 "uci_log": uci_log,

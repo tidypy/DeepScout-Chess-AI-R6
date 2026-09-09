@@ -82,6 +82,22 @@ async def list_databases():
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     return game_service.list_available_databases()
 
+@app.post("/api/v1/databases/ensure-default")
+async def ensure_default_database():
+    """Create sparring.sqlite as an empty database if it does not already exist on disk."""
+    if not game_service:
+        raise HTTPException(status_code=500, detail="GameService not initialized.")
+    sparring_path = os.path.join(game_service.root_dir, "sparring.sqlite")
+    created = False
+    if not os.path.exists(sparring_path):
+        try:
+            GameRepository.create_empty_db(sparring_path)
+            created = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create sparring.sqlite: {e}")
+    return {"created": created, "db_name": "sparring.sqlite"}
+
+
 @app.get("/api/v1/databases/storage")
 async def get_storage_telemetry():
     if not game_service:

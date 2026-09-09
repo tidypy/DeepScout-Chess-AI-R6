@@ -11,11 +11,10 @@ import { AskGrandmasterAction } from "./features/ai_grandmaster/AskGrandmasterAc
 import { SparView } from "./features/sparring/SparView";
 import { BookBuilderView } from "./features/book_builder/BookBuilderView";
 import { ThemeCustomizer } from "./components/theme/ThemeCustomizer";
-import { ClickLogConsole } from "./components/debug/ClickLogConsole";
 import { Tooltip } from "./components/common/Tooltip";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
 import { useQuery } from "@tanstack/react-query";
-import { fetchGame, fetchDatabases } from "./lib/api";
+import { fetchGame, fetchDatabases, ensureDefaultDatabase } from "./lib/api";
 import {
   UXTheme,
   BoardTheme,
@@ -43,8 +42,12 @@ function MainApp() {
   const [activeView, setActiveView] = useState<string>("Analysis");
 
   // Game Selection
-  const [gameId, setGameId] = useState<number>(1);
-  const [activeGameDb, setActiveGameDb] = useState<string>("patriciaTourny.sqlite");
+  const [gameId, setGameId] = useState<number>(
+    () => parseInt(localStorage.getItem("deepscout_last_game_id") || "1", 10) || 1
+  );
+  const [activeGameDb, setActiveGameDb] = useState<string>(
+    () => localStorage.getItem("deepscout_last_opened_db") || "patriciaTourny.sqlite"
+  );
   const [currentBoardFen, setCurrentBoardFen] = useState<string>("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
   const [analysisStats, setAnalysisStats] = useState<AnalysisGameStats | undefined>(undefined);
 
@@ -95,6 +98,51 @@ function MainApp() {
   useEffect(() => {
     logActionRef.current = logAction;
   });
+
+  // --- Analysis DB Persistence & Self-Healing Fallback ---
+  // Runs once when dbList resolves. Validates stored db against live list,
+  // falls back to sparring.sqlite, and self-heals if sparring.sqlite is also absent.
+  useEffect(() => {
+    if (!dbList || dbList.length === 0) return; // Wait for sidecar to respond
+
+    const storedDb = localStorage.getItem("deepscout_last_opened_db");
+    const storedGameId = parseInt(localStorage.getItem("deepscout_last_game_id") || "1", 10) || 1;
+
+    const inList = (name: string) => dbList.some((d) => d.name === name);
+
+    if (storedDb && inList(storedDb)) {
+      // Primary: restore last session exactly
+      setActiveGameDb(storedDb);
+      setGameId(storedGameId);
+      logActionRef.current("SYSTEM", `Restored last session: ${storedDb} game #${storedGameId}`);
+      return;
+    }
+
+    if (inList("sparring.sqlite")) {
+      // Fallback 1: sparring.sqlite exists — mount it, reset game to 1
+      setActiveGameDb("sparring.sqlite");
+      setGameId(1);
+      localStorage.setItem("deepscout_last_opened_db", "sparring.sqlite");
+      localStorage.setItem("deepscout_last_game_id", "1");
+      logActionRef.current("SYSTEM", "Fallback 1: mounted sparring.sqlite (last_db not found)");
+      return;
+    }
+
+    // Fallback 2 (Self-Healing): neither stored db nor sparring.sqlite present
+    // Call backend to create an empty sparring.sqlite, then re-invalidate dbList
+    ensureDefaultDatabase()
+      .then(() => {
+        setActiveGameDb("sparring.sqlite");
+        setGameId(1);
+        localStorage.setItem("deepscout_last_opened_db", "sparring.sqlite");
+        localStorage.setItem("deepscout_last_game_id", "1");
+        logActionRef.current("SYSTEM", "Fallback 2: self-healed — created sparring.sqlite via backend");
+        window.dispatchEvent(new CustomEvent("deepscout:db-healed"));
+      })
+      .catch((err) => {
+        logActionRef.current("ERROR", "Self-heal failed — could not create sparring.sqlite", String(err));
+      });
+  }, [dbList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleOpenTheme = (tab: "ux" | "board" | "custom") => {
     setThemeModalTab(tab);
@@ -218,9 +266,12 @@ function MainApp() {
                       <select
                         value={activeGameDb}
                         onChange={(e) => {
-                          setActiveGameDb(e.target.value);
+                          const selected = e.target.value;
+                          setActiveGameDb(selected);
                           setGameId(1);
-                          logAction("CLICK", `Switched Analysis Database to ${e.target.value}`);
+                          localStorage.setItem("deepscout_last_opened_db", selected);
+                          localStorage.setItem("deepscout_last_game_id", "1");
+                          logAction("CLICK", `Switched Analysis Database to ${selected}`);
                         }}
                         className={`text-[11px] font-mono font-extrabold rounded-lg px-2 py-0.5 border outline-none cursor-pointer ${
                           isLight ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-950" : "bg-emerald-950/40 border-emerald-500/40 text-emerald-300"
@@ -253,6 +304,7 @@ function MainApp() {
                               onClick={() => {
                                 const nextId = Math.max(1, gameId - 1);
                                 setGameId(nextId);
+                                localStorage.setItem("deepscout_last_game_id", String(nextId));
                                 logAction("NAV", `Analysis Navigated to Game #${nextId}`);
                               }}
                               disabled={gameId <= 1}
@@ -268,6 +320,7 @@ function MainApp() {
                               onClick={() => {
                                 const nextId = gameId + 1;
                                 setGameId(nextId);
+                                localStorage.setItem("deepscout_last_game_id", String(nextId));
                                 logAction("NAV", `Analysis Navigated to Game #${nextId}`);
                               }}
                               className="p-1 rounded-md hover:bg-slate-200 dark:hover:bg-white/10 cursor-pointer"
@@ -565,9 +618,6 @@ function MainApp() {
               <EnginesView uxTheme={currentUXTheme} />
             </div>
           )}
-
-          {/* Bottom Click & Debug Logger Console */}
-          <ClickLogConsole />
         </div>
       </div>
 

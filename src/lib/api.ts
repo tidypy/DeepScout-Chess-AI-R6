@@ -62,6 +62,12 @@ export const fetchDatabases = async (): Promise<DatabaseInfo[]> => {
   return res.json();
 };
 
+export const ensureDefaultDatabase = async (): Promise<{ created: boolean; db_name: string }> => {
+  const res = await fetch(`${API_BASE}/databases/ensure-default`, { method: "POST" });
+  if (!res.ok) throw new Error("Failed to ensure default database");
+  return res.json();
+};
+
 export interface StorageTelemetry {
   total_size_mb: number;
   total_size_gb: number;
