@@ -15,7 +15,7 @@ class MergeRequest(BaseModel):
     deduplicate: bool = True
 
 @router.post("/merge")
-async def merge_databases(req: MergeRequest):
+def merge_databases(req: MergeRequest):
     if not req.source_dbs:
         raise HTTPException(status_code=400, detail="At least one source database must be selected.")
     if not req.target_db_name.strip():

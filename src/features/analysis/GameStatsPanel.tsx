@@ -1,6 +1,18 @@
 import { UXTheme } from "../../lib/theme";
 import { BarChart2, Zap, RefreshCw, CheckCircle2, AlertCircle } from "lucide-react";
-import { AnalysisGameStats } from "../../components/chessboard/ResponsiveChessboard";
+import { AnalysisGameStats, QualityFilterKey } from "../../components/chessboard/ResponsiveChessboard";
+
+const TERMINATION_LABELS: Record<string, { badge: string; full: string }> = {
+  MANUAL_RESIGN: { badge: "Resigned", full: "Manual Resignation" },
+  TIME_FORFEIT: { badge: "Time Forfeit", full: "Time Forfeit" },
+  EVAL_ADJUDICATED: { badge: "Adjudicated", full: "Evaluation Threshold" },
+  CHECKMATE: { badge: "Checkmate", full: "Checkmate" },
+  STALEMATE: { badge: "Stalemate", full: "Stalemate" },
+  DRAW_INSUFFICIENT: { badge: "Draw", full: "Insufficient Material" },
+  DRAW_REPETITION: { badge: "Draw", full: "Threefold Repetition" },
+  DRAW_FIFTY: { badge: "Draw", full: "Fifty-Move Rule" },
+  DRAW: { badge: "Draw", full: "Draw" },
+};
 
 interface GameStatsPanelProps {
   stats?: AnalysisGameStats;
@@ -14,11 +26,20 @@ interface GameStatsPanelProps {
     date?: string;
     eco?: string;
     opening?: string;
+    termination?: string | null;
+    final_eval?: string | null;
+    eval_source?: string | null;
+    player_acpl?: number | null;
+    engine_acpl?: number | null;
   } | null;
   uxTheme: UXTheme;
   isAnalyzingFullGame?: boolean;
   analysisProgress?: { current: number; total: number } | null;
   onRunFullAnalysis?: () => void;
+  /** Currently active move-quality filter (null/undefined = show all moves). */
+  activeQualityFilter?: QualityFilterKey | null;
+  /** Called when a Move Quality tile is clicked; null clears the filter. */
+  onQualityFilterChange?: (key: QualityFilterKey | null) => void;
 }
 
 export function GameStatsPanel({
@@ -28,14 +49,32 @@ export function GameStatsPanel({
   isAnalyzingFullGame,
   analysisProgress,
   onRunFullAnalysis,
+  activeQualityFilter,
+  onQualityFilterChange,
 }: GameStatsPanelProps) {
   const isLight = uxTheme.mode === "light";
 
-  const hasAnalysis = stats?.hasEngineAnalysis ?? false;
-  const whiteAcpl = stats?.whiteAcpl;
-  const blackAcpl = stats?.blackAcpl;
-  const whiteAccuracy = stats?.whiteAccuracy;
-  const blackAccuracy = stats?.blackAccuracy;
+  const termination = stats?.termination || gameDetails?.termination;
+  const rawFinalEval = (stats?.finalEval || gameDetails?.final_eval || "").trim();
+  const rawEvalSource = (stats?.evalSource || gameDetails?.eval_source || "").trim();
+  const cleanEvalSource =
+    rawEvalSource && rawEvalSource.toUpperCase() !== "NONE" ? rawEvalSource : null;
+  const finalEval =
+    rawFinalEval && rawFinalEval.toUpperCase() !== "NONE"
+      ? rawFinalEval
+      : null;
+  const playerAcpl = stats?.playerAcpl ?? gameDetails?.player_acpl;
+  const engineAcpl = stats?.engineAcpl ?? gameDetails?.engine_acpl;
+
+  const hasAnalysis =
+    (stats?.hasEngineAnalysis ?? false) ||
+    playerAcpl != null ||
+    engineAcpl != null;
+
+  const whiteAcpl = stats?.whiteAcpl ?? (playerAcpl != null ? playerAcpl : undefined);
+  const blackAcpl = stats?.blackAcpl ?? (engineAcpl != null ? engineAcpl : undefined);
+  const whiteAccuracy = stats?.whiteAccuracy ?? (whiteAcpl !== undefined ? Math.max(35, Math.min(100, Math.round(100 - whiteAcpl * 0.35))) : undefined);
+  const blackAccuracy = stats?.blackAccuracy ?? (blackAcpl !== undefined ? Math.max(35, Math.min(100, Math.round(100 - blackAcpl * 0.35))) : undefined);
 
   const totalMoves = stats?.totalMoves ?? 0;
   const totalPlies = stats?.totalPlies ?? 0;
@@ -51,6 +90,26 @@ export function GameStatsPanel({
   const resultStr = gameDetails?.result || "*";
   const isWhiteWin = resultStr === "1-0";
   const isBlackWin = resultStr === "0-1";
+
+  const qualityTiles: Array<{
+    key: QualityFilterKey;
+    label: string;
+    title: string;
+    count: number;
+    fallback?: string | number;
+    span?: string;
+    valueClass?: string;
+    light: string;
+    dark: string;
+  }> = [
+    { key: "best", label: "✨ Best", title: "Best Moves", count: bestCount, light: "bg-emerald-50 border-emerald-200 text-emerald-950", dark: "bg-emerald-950/30 border-emerald-500/30 text-emerald-300" },
+    { key: "good", label: "✓ Good", title: "Good Moves", count: goodCount, fallback: totalPlies, light: "bg-cyan-50 border-cyan-200 text-cyan-950", dark: "bg-cyan-950/30 border-cyan-500/30 text-cyan-300" },
+    { key: "book", label: "📖 Book", title: "Theory Book Moves", count: bookCount, fallback: bookCount, light: "bg-purple-50 border-purple-200 text-purple-950", dark: "bg-purple-950/30 border-purple-500/30 text-purple-300" },
+    { key: "tactical", label: "⚡ Tactic", title: "Decisive Tactical Combinations", count: tacticalCount, light: "bg-indigo-50 border-indigo-200 text-indigo-950", dark: "bg-indigo-950/30 border-indigo-500/30 text-indigo-300" },
+    { key: "inaccuracy", label: "?! Inacc", title: "Inaccuracies", count: inaccuracyCount, light: "bg-yellow-50 border-yellow-200 text-yellow-950", dark: "bg-yellow-950/30 border-yellow-500/30 text-yellow-300" },
+    { key: "mistake", label: "? Mistake", title: "Mistakes", count: mistakeCount, light: "bg-orange-50 border-orange-200 text-orange-950", dark: "bg-orange-950/30 border-orange-500/30 text-orange-300" },
+    { key: "blunder", label: "?? Blunders", title: "Blunders", count: blunderCount, span: "col-span-2", valueClass: "text-rose-600 dark:text-rose-400", light: "bg-red-50 border-red-200 text-red-950", dark: "bg-red-950/30 border-red-500/30 text-red-300" },
+  ];
 
   return (
     <div
@@ -73,6 +132,47 @@ export function GameStatsPanel({
           {totalMoves} Moves ({totalPlies} Plies)
         </span>
       </div>
+
+      {/* Post-Match Adjudication & Telemetry Summary Banner */}
+      {(termination || finalEval) && (
+        <div
+          className={`p-3 rounded-2xl border mb-3 flex flex-col gap-2 font-mono text-xs ${
+            isLight
+              ? "bg-emerald-500/10 border-emerald-300/60 text-emerald-950"
+              : "bg-emerald-950/25 border-emerald-500/30 text-emerald-200"
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <span className="font-extrabold uppercase tracking-wide flex items-center gap-1.5 text-[11px]">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              Match Adjudication
+            </span>
+            {termination && (
+              <span className="text-[10px] font-black px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
+                {termination ? TERMINATION_LABELS[termination]?.badge ?? termination : ""}
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-emerald-500/20">
+            <div>
+              <span className="opacity-70 text-[10px] block">Termination</span>
+              <span className="font-bold">
+                {termination ? TERMINATION_LABELS[termination]?.full ?? termination : "Standard"}
+              </span>
+            </div>
+            <div>
+              <span className="opacity-70 text-[10px] block">Final Evaluation</span>
+              <span className="font-bold">
+                {finalEval || "—"}
+                {cleanEvalSource && (
+                  <span className="text-[9px] opacity-75 font-normal ml-1">({cleanEvalSource})</span>
+                )}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Accuracy & ACPL Head-to-Head */}
       {hasAnalysis ? (
@@ -192,99 +292,38 @@ export function GameStatsPanel({
         </div>
 
         <div className="grid grid-cols-4 gap-1.5 text-center font-mono">
-          {/* Best */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-emerald-50 border-emerald-200 text-emerald-950"
-                : "bg-emerald-950/30 border-emerald-500/30 text-emerald-300"
-            }`}
-            title="Best Moves"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">✨ Best</span>
-            <span className="text-sm font-black">{hasAnalysis ? bestCount : "—"}</span>
-          </div>
-
-          {/* Good */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-cyan-50 border-cyan-200 text-cyan-950"
-                : "bg-cyan-950/30 border-cyan-500/30 text-cyan-300"
-            }`}
-            title="Good Moves"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">✓ Good</span>
-            <span className="text-sm font-black">{hasAnalysis ? goodCount : totalPlies}</span>
-          </div>
-
-          {/* Book */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-purple-50 border-purple-200 text-purple-950"
-                : "bg-purple-950/30 border-purple-500/30 text-purple-300"
-            }`}
-            title="Theory Book Moves"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">📖 Book</span>
-            <span className="text-sm font-black">{bookCount}</span>
-          </div>
-
-          {/* Tactics */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-indigo-50 border-indigo-200 text-indigo-950"
-                : "bg-indigo-950/30 border-indigo-500/30 text-indigo-300"
-            }`}
-            title="Decisive Tactical Combinations"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">⚡ Tactic</span>
-            <span className="text-sm font-black">{hasAnalysis ? tacticalCount : "—"}</span>
-          </div>
-
-          {/* Inaccuracies */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-yellow-50 border-yellow-200 text-yellow-950"
-                : "bg-yellow-950/30 border-yellow-500/30 text-yellow-300"
-            }`}
-            title="Inaccuracies"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">?! Inacc</span>
-            <span className="text-sm font-black">{hasAnalysis ? inaccuracyCount : "—"}</span>
-          </div>
-
-          {/* Mistakes */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center ${
-              isLight
-                ? "bg-orange-50 border-orange-200 text-orange-950"
-                : "bg-orange-950/30 border-orange-500/30 text-orange-300"
-            }`}
-            title="Mistakes"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">? Mistake</span>
-            <span className="text-sm font-black">{hasAnalysis ? mistakeCount : "—"}</span>
-          </div>
-
-          {/* Blunders */}
-          <div
-            className={`p-1.5 rounded-xl border flex flex-col items-center col-span-2 ${
-              isLight
-                ? "bg-red-50 border-red-200 text-red-950"
-                : "bg-red-950/30 border-red-500/30 text-red-300"
-            }`}
-            title="Blunders"
-          >
-            <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">?? Blunders</span>
-            <span className="text-sm font-black text-rose-600 dark:text-rose-400">
-              {hasAnalysis ? blunderCount : "—"}
-            </span>
-          </div>
+          {qualityTiles.map((tile) => {
+            const isActive = activeQualityFilter === tile.key;
+            const clickable = !!onQualityFilterChange && hasAnalysis;
+            return (
+              <button
+                key={tile.key}
+                type="button"
+                disabled={!clickable}
+                onClick={() => onQualityFilterChange?.(isActive ? null : tile.key)}
+                aria-pressed={isActive}
+                className={`p-1.5 rounded-xl border flex flex-col items-center transition-all ${tile.span ?? ""} ${
+                  isLight ? tile.light : tile.dark
+                } ${clickable ? "cursor-pointer hover:brightness-110 active:scale-95" : "cursor-default"} ${
+                  isActive ? "ring-2 ring-offset-0 ring-emerald-400 shadow-lg scale-[1.03]" : activeQualityFilter ? "opacity-50" : ""
+                }`}
+                title={clickable ? `${tile.title} — click to ${isActive ? "clear filter" : "show only these moves"}` : tile.title}
+              >
+                <span className="text-[10px] font-bold opacity-80 flex items-center gap-0.5">{tile.label}</span>
+                <span className={`text-sm font-black ${tile.valueClass ?? ""}`}>{hasAnalysis ? tile.count : tile.fallback ?? "—"}</span>
+              </button>
+            );
+          })}
         </div>
+        {activeQualityFilter && onQualityFilterChange && (
+          <button
+            type="button"
+            onClick={() => onQualityFilterChange(null)}
+            className="w-full text-[10px] font-mono font-bold py-1 rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25 cursor-pointer"
+          >
+            Showing only {qualityTiles.find((t) => t.key === activeQualityFilter)?.title} — clear filter
+          </button>
+        )}
       </div>
     </div>
   );

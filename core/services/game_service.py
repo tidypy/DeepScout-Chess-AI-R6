@@ -1,6 +1,12 @@
 import os
-from typing import Optional, Dict, Any, List
-from core.persistence.database import GameRepository
+import re
+import sqlite3
+from typing import Optional, Dict, Any, List, Union
+from core.persistence.database import (
+    GameRepository,
+    strip_fake_zero_acpl_comments,
+    has_genuine_gold_eval,
+)
 
 class GameService:
     """
@@ -80,9 +86,30 @@ class GameService:
             sort_order=sort_order,
         )
 
-    def get_game(self, game_id: int, db_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_game(self, game_id: Union[int, str], db_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         repo = self._get_or_create_repo(db_name) if db_name else self.repo
         return repo.get_game(game_id)
+
+    def append_variation_to_game(
+        self,
+        game_id: Union[int, str],
+        ply: int,
+        pv_san: str,
+        db_name: Optional[str] = None,
+        eval_str: Optional[str] = None,
+        engine_name: Optional[str] = None,
+        depth: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        repo = self._get_or_create_repo(db_name) if db_name else self.repo
+        return repo.append_variation_to_pgn(
+            game_id=game_id,
+            ply=ply,
+            pv_san=pv_san,
+            eval_str=eval_str,
+            engine_name=engine_name,
+            depth=depth,
+        )
+
 
     def list_players(self, search: Optional[str] = None, limit: int = 50, db_name: Optional[str] = None) -> List[Dict[str, Any]]:
         repo = self._get_or_create_repo(db_name) if db_name else self.repo
@@ -93,69 +120,102 @@ class GameService:
         return repo.get_database_stats()
 
     @staticmethod
-    def _is_game_db(db_path: str) -> bool:
+    def _open_connection(db_path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
         try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout = 10000;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+        except Exception:
+            pass
+        return conn
+
+    @staticmethod
+    def _is_game_db(db_path: str) -> bool:
+        conn = None
+        try:
+            conn = GameService._open_connection(db_path)
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [r[0].lower() for r in cur.fetchall()]
-            conn.close()
             valid_tables = {'games', 'variations', 'flags', 'sparring_games', 'kibitzer_analysis', 'tutor_games'}
             return any(t in valid_tables for t in tables) or any(t.endswith(('games', 'variations', 'flags')) for t in tables)
         except Exception:
             return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _classify_db_tier(db_path: str) -> Dict[str, Any]:
         """
         Fast tier inspection for database shelf:
-        - Gold Tier: Contains Stockfish / ACPL eval provenance in _DATA_
-        - Silver Tier: Standardized with ECO tags and player Elo
-        - Companion Stream: Sparring, Kibitzer, or Tutor database
+        - Gold Tier: Contains genuine engine ply evaluations / real Gold provenance
+        - Silver Tier: Standardized with ECO/Elo or valid >= 2-ply Silver sparring games
+        - Companion Stream: Kibitzer or Tutor database
         - Raw Tier: Unsanitized / needs fitness audit
         """
+        conn = None
         try:
-            import sqlite3
             base_name = os.path.basename(db_path).lower()
             if base_name in ("kibitzer_analysis.sqlite", "tutor_games.sqlite"):
                 return {"tier": "Companion Stream", "tier_level": 2, "grade": "A", "badge_color": "cyan"}
 
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
+            conn = GameService._open_connection(db_path)
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [r[0].lower() for r in cur.fetchall()]
-            target_table = "games" if "games" in tables else ("Games" if "Games" in tables else (tables[0] if tables else None))
+            tables = [r[0] for r in cur.fetchall()]
+            tables_lower = {t.lower(): t for t in tables}
+            target_table = tables_lower.get("games") or (tables[0] if tables else None)
             if not target_table:
-                conn.close()
                 return {"tier": "Raw Tier", "tier_level": 0, "grade": "Needs Audit", "badge_color": "amber"}
 
             cur.execute(f"SELECT ROWID, * FROM {target_table} LIMIT 25")
             rows = [dict(r) for r in cur.fetchall()]
-            conn.close()
 
             if not rows:
                 return {"tier": "Raw Tier", "tier_level": 0, "grade": "Empty", "badge_color": "slate"}
 
-            has_evals = any(
-                ("[%acpl" in str(r.get("_DATA_") or "") or "[%provenance" in str(r.get("_DATA_") or "") or "[%eval" in str(r.get("_DATA_") or ""))
-                for r in rows
-            )
-            if has_evals:
+            def _row_pgn(r: Dict[str, Any]) -> str:
+                raw = r.get("_DATA_") or r.get("pgn") or ""
+                if isinstance(raw, bytes):
+                    return raw.decode("utf-8", errors="replace")
+                return str(raw)
+
+            gold_count = 0
+            silver_count = 0
+            for r in rows:
+                txt = strip_fake_zero_acpl_comments(_row_pgn(r))
+                ply = int(r.get("PLYCOUNT") or 0) if str(r.get("PLYCOUNT") or "").isdigit() else 0
+                if has_genuine_gold_eval(txt, ply_count=ply or None):
+                    gold_count += 1
+                elif (
+                    re.search(r'\[DataTier\s+"Silver"\]', txt, re.IGNORECASE)
+                    or (
+                        (r.get("ECO") or r.get("eco"))
+                        and (str(r.get("WHITEELO") or r.get("white_elo") or "").isdigit() or str(r.get("BLACKELO") or r.get("black_elo") or "").isdigit())
+                    )
+                ):
+                    silver_count += 1
+
+            if gold_count > 0:
                 return {"tier": "Gold Tier", "tier_level": 3, "grade": "A+", "badge_color": "gold"}
 
-            has_eco_elo = sum(
-                1 for r in rows
-                if (r.get("ECO") or r.get("eco")) and (str(r.get("WHITEELO") or r.get("white_elo") or "").isdigit())
-            ) >= (len(rows) * 0.4)
-
-            if has_eco_elo:
+            if silver_count >= (len(rows) * 0.4):
                 return {"tier": "Silver Tier", "tier_level": 2, "grade": "B+", "badge_color": "silver"}
 
             return {"tier": "Raw Tier", "tier_level": 1, "grade": "Needs Fitness", "badge_color": "amber"}
         except Exception:
             return {"tier": "Raw Tier", "tier_level": 0, "grade": "Needs Audit", "badge_color": "amber"}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def list_available_databases(self) -> List[Dict[str, Any]]:
         results = []
@@ -415,71 +475,79 @@ class GameService:
         if os.path.exists(target_path):
             raise FileExistsError(f"Database '{clean_target}' already exists.")
 
-        import sqlite3
         src_conn = source_repo._get_connection()
-        src_cur = src_conn.cursor()
+        tgt_conn = None
+        try:
+            src_cur = src_conn.cursor()
 
-        # Build query
-        query = "SELECT * FROM Games WHERE 1=1"
-        params: List[Any] = []
-        if game_ids:
-            placeholders = ",".join("?" for _ in game_ids)
-            query += f" AND ROWID IN ({placeholders})"
-            params.extend(game_ids)
-        else:
-            if search:
-                query += " AND (WHITE LIKE ? OR BLACK LIKE ? OR EVENT LIKE ? OR ECO LIKE ?)"
-                t = f"%{search}%"
-                params.extend([t, t, t, t])
-            if white:
-                query += " AND WHITE LIKE ?"
-                params.append(f"%{white}%")
-            if black:
-                query += " AND BLACK LIKE ?"
-                params.append(f"%{black}%")
-            if eco:
-                query += " AND ECO LIKE ?"
-                params.append(f"%{eco}%")
-            if result:
-                query += " AND RESULT = ?"
-                params.append(result)
+            # Build query
+            query = "SELECT * FROM Games WHERE 1=1"
+            params: List[Any] = []
+            if game_ids:
+                placeholders = ",".join("?" for _ in game_ids)
+                query += f" AND ROWID IN ({placeholders})"
+                params.extend(game_ids)
+            else:
+                if search:
+                    query += " AND (WHITE LIKE ? OR BLACK LIKE ? OR EVENT LIKE ? OR ECO LIKE ?)"
+                    t = f"%{search}%"
+                    params.extend([t, t, t, t])
+                if white:
+                    query += " AND WHITE LIKE ?"
+                    params.append(f"%{white}%")
+                if black:
+                    query += " AND BLACK LIKE ?"
+                    params.append(f"%{black}%")
+                if eco:
+                    query += " AND ECO LIKE ?"
+                    params.append(f"%{eco}%")
+                if result:
+                    query += " AND RESULT = ?"
+                    params.append(result)
 
-        src_cur.execute(query, params)
-        col_names = [col[0] for col in src_cur.description]
-        rows = src_cur.fetchall()
+            src_cur.execute(query, params)
+            col_names = [col[0] for col in src_cur.description]
+            rows = src_cur.fetchall()
 
-        if not rows:
-            src_conn.close()
-            return {"success": True, "target_db": clean_target, "exported_games": 0}
+            if not rows:
+                return {"success": True, "target_db": clean_target, "exported_games": 0}
 
-        # Initialize Target SQLite DB
-        tgt_conn = sqlite3.connect(target_path)
-        tgt_cur = tgt_conn.cursor()
+            # Initialize Target SQLite DB with busy_timeout & synchronous pragmas
+            tgt_conn = self._open_connection(target_path)
+            tgt_cur = tgt_conn.cursor()
 
-        # Get CREATE TABLE schema from source
-        src_cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='Games'")
-        create_sql = src_cur.fetchone()
-        if create_sql and create_sql["sql"]:
-            tgt_cur.execute(create_sql["sql"])
-        else:
-            tgt_cur.execute("""
-                CREATE TABLE Games (
-                    WHITE TEXT, BLACK TEXT, RESULT TEXT, DATE TEXT,
-                    EVENT TEXT, SITE TEXT, ECO TEXT, PLIES INTEGER,
-                    WHITE_ELO INTEGER, BLACK_ELO INTEGER, FEN TEXT,
-                    _DATA_ BLOB
-                );
-            """)
+            # Get CREATE TABLE schema from source
+            src_cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND LOWER(name)='games'")
+            create_sql = src_cur.fetchone()
+            if create_sql and create_sql["sql"]:
+                tgt_cur.execute(create_sql["sql"])
+            else:
+                tgt_cur.execute("""
+                    CREATE TABLE Games (
+                        WHITE TEXT, BLACK TEXT, RESULT TEXT, DATE TEXT,
+                        EVENT TEXT, SITE TEXT, ECO TEXT, PLIES INTEGER,
+                        WHITE_ELO INTEGER, BLACK_ELO INTEGER, FEN TEXT,
+                        _DATA_ BLOB
+                    );
+                """)
 
-        col_placeholders = ",".join("?" for _ in col_names)
-        insert_sql = f"INSERT INTO Games ({','.join(col_names)}) VALUES ({col_placeholders})"
+            col_placeholders = ",".join("?" for _ in col_names)
+            insert_sql = f"INSERT INTO Games ({','.join(col_names)}) VALUES ({col_placeholders})"
 
-        for r in rows:
-            tgt_cur.execute(insert_sql, tuple(r))
+            for r in rows:
+                tgt_cur.execute(insert_sql, tuple(r))
 
-        tgt_conn.commit()
-        tgt_conn.close()
-        src_conn.close()
+            tgt_conn.commit()
+        finally:
+            if tgt_conn is not None:
+                try:
+                    tgt_conn.close()
+                except Exception:
+                    pass
+            try:
+                src_conn.close()
+            except Exception:
+                pass
 
         # Create repo entry in cache
         self._get_or_create_repo(clean_target)

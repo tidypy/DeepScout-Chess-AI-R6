@@ -29,11 +29,15 @@ ai_config.json
 *.key
 *.pem
 
-# SQLite temporary WAL/SHM
+# SQLite runtime databases & temporary WAL/SHM
+*.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.db-wal
 *.db-shm
+
+# Archived legacy PySide6 reference tree
+examples/lucas_legacy_reference/
 
 # Build artifacts & diagnostic dump files
 build/

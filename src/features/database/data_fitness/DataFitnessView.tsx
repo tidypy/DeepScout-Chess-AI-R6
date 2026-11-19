@@ -12,6 +12,8 @@ import {
   startMassAnalysis,
   fetchMassAnalysisStatus,
   cancelMassAnalysis,
+  repairSparringDatabase,
+  RepairSparringResponse,
 } from "../../../lib/api";
 import { Tooltip } from "../../../components/common/Tooltip";
 import {
@@ -25,6 +27,7 @@ import {
   Sparkles,
   Play,
   Layers,
+  Wrench,
 } from "lucide-react";
 
 interface DataFitnessViewProps {
@@ -70,6 +73,8 @@ export function DataFitnessView({
   const [analysisDepth, setAnalysisDepth] = useState<number>(16);
   const [analysisMode, setAnalysisMode] = useState<"MISSING_ONLY" | "OVERWRITE">("MISSING_ONLY");
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [repairReport, setRepairReport] = useState<RepairSparringResponse | null>(null);
+  const [repairError, setRepairError] = useState<string | null>(null);
 
   // 1. Fetch available databases
   const { data: databases } = useQuery({
@@ -129,6 +134,34 @@ export function DataFitnessView({
     },
   });
 
+  // 4b. Pass 2: Repair Sparring Database Mutation
+  const repairTargetDb = selectedDb.toLowerCase().includes("sparring")
+    ? selectedDb
+    : "Sparring_Games.sqlite";
+  const repairSparringMutation = useMutation({
+    mutationFn: () => repairSparringDatabase(repairTargetDb),
+    onMutate: () => {
+      setRepairError(null);
+    },
+    onSuccess: (data) => {
+      setRepairReport(data);
+      logAction(
+        "API",
+        `Repaired Sparring DB (${data.database_name})`,
+        `Backfilled: ${data.backfilled_rows}, Names: ${data.repaired_engine_names}, Silver: ${data.downgraded_to_silver}, Gold: ${data.confirmed_gold}, Purged stubs: ${data.purged_empty_stubs}`
+      );
+      refetchAudit();
+      queryClient.invalidateQueries({ queryKey: ["databases"] });
+      queryClient.invalidateQueries({ queryKey: ["browserGames"] });
+      queryClient.invalidateQueries({ queryKey: ["game"] });
+      window.dispatchEvent(new CustomEvent("deepscout:db-healed"));
+    },
+    onError: (err: any) => {
+      setRepairError(err?.message || "Failed to repair Sparring database");
+      logAction("ERROR", `Repair Sparring DB failed: ${err?.message || err}`);
+    },
+  });
+
   // 5. Mass Analysis Start Mutation
   const startAnalysisMutation = useMutation({
     mutationFn: (overrideMode?: string) =>
@@ -175,6 +208,8 @@ export function DataFitnessView({
     if (jobStatus && jobStatus.status === "completed") {
       refetchAudit();
       queryClient.invalidateQueries({ queryKey: ["databases"] });
+      queryClient.invalidateQueries({ queryKey: ["browserGames"] });
+      queryClient.invalidateQueries({ queryKey: ["game"] });
     }
   }, [jobStatus, refetchAudit, queryClient]);
 
@@ -232,6 +267,21 @@ export function DataFitnessView({
             </select>
           </div>
 
+          <Tooltip content={`Backfill missing SQL columns from PGN, repair mangled engine names, classify Silver/Gold honestly, and purge <2-ply stubs in ${repairTargetDb}`}>
+            <button
+              onClick={() => repairSparringMutation.mutate()}
+              disabled={repairSparringMutation.isPending}
+              className="px-3.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-xs font-bold rounded-xl border border-amber-500/40 shadow-md transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              {repairSparringMutation.isPending ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Wrench className="w-3.5 h-3.5 text-amber-400" />
+              )}
+              {repairSparringMutation.isPending ? "Repairing..." : "Repair Sparring DB"}
+            </button>
+          </Tooltip>
+
           <Tooltip content="Browse Database Games">
             <button
               onClick={() => {
@@ -246,6 +296,48 @@ export function DataFitnessView({
           </Tooltip>
         </div>
       </div>
+
+      {/* Sparring DB Repair Result Banner */}
+      {repairReport && (
+        <div className="p-4 rounded-2xl bg-emerald-950/35 border border-emerald-500/40 flex flex-col md:flex-row md:items-center justify-between gap-3 font-mono text-xs text-emerald-200 animate-in fade-in duration-150">
+          <div className="flex items-start gap-2.5">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-extrabold text-emerald-300 block">
+                Repaired {repairReport.database_name}
+              </span>
+              <span className="text-[11px] opacity-90">
+                Backfilled columns: <strong>{repairReport.backfilled_rows}</strong> · Engine names fixed:{" "}
+                <strong>{repairReport.repaired_engine_names}</strong> · Downgraded fake-Gold → Silver:{" "}
+                <strong>{repairReport.downgraded_to_silver}</strong> · Silver:{" "}
+                <strong>{repairReport.confirmed_silver}</strong> · Gold:{" "}
+                <strong>{repairReport.confirmed_gold}</strong> · Empty &lt;2-ply stubs purged:{" "}
+                <strong>{repairReport.purged_empty_stubs}</strong>
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={() => setRepairReport(null)}
+            className="text-[10px] px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 self-end md:self-center cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      {repairError && (
+        <div className="p-3 rounded-2xl bg-rose-950/40 border border-rose-500/40 text-xs font-mono text-rose-300 flex items-center justify-between gap-2">
+          <span className="flex items-center gap-2">
+            <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            {repairError}
+          </span>
+          <button
+            onClick={() => setRepairError(null)}
+            className="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Database Ingestion & Import Configuration Card */}
       {pendingImportFile && (
@@ -532,7 +624,7 @@ export function DataFitnessView({
 
               <div className="p-3.5 rounded-2xl bg-black/30 border border-white/5 flex items-center justify-between">
                 <div>
-                  <span className="font-bold text-white block">Short Stubs & Accidental Aborts (&lt; 3 plies)</span>
+                  <span className="font-bold text-white block">Short Stubs & Accidental Aborts (&lt; 2 plies)</span>
                   <span className="text-[10px] text-slate-500">Corrupted zero-move records to purge from analytics</span>
                 </div>
                 <span className={`font-mono font-bold text-sm ${auditData?.issues?.short_stubs ? "text-rose-400" : "text-emerald-400"}`}>
@@ -586,7 +678,7 @@ export function DataFitnessView({
                   />
                   <div>
                     <span className="font-bold text-slate-200 block">Purge Zero-Move Stubs</span>
-                    <span className="text-[10px] text-slate-500">Delete unusable &lt; 3 ply records safely via WAL</span>
+                    <span className="text-[10px] text-slate-500">Delete unusable &lt; 2 ply records safely via WAL</span>
                   </div>
                 </label>
               </div>

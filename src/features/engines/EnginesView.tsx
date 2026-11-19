@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   fetchEngineList,
@@ -9,11 +9,14 @@ import {
   cloneEngine,
   removeCustomEngine,
   fetchEngineOptions,
+  fetchEngineRoles,
+  updateEngineRole,
   EngineInfo,
   TestUciResult,
 } from "../../lib/api";
 import { UXTheme } from "../../lib/theme";
 import { UciOptionsInspector } from "./UciOptionsInspector";
+import { AnalyzerQuickSettingsModal, PRESET_DEFINITIONS } from "../analysis/AnalyzerQuickSettingsModal";
 import { useClickLogger } from "../../lib/clickLogger";
 import {
   Cpu,
@@ -28,6 +31,10 @@ import {
   Check,
   X,
   Zap,
+  Settings2,
+  Brain,
+  GraduationCap,
+  Microscope,
 } from "lucide-react";
 
 interface EnginesViewProps {
@@ -53,6 +60,7 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isCloneModalOpen, setIsCloneModalOpen] = useState(false);
+  const [isAnalyzerModalOpen, setIsAnalyzerModalOpen] = useState(false);
   const [activeEngine, setActiveEngine] = useState<EngineInfo | null>(null);
 
   // Add Engine Form State
@@ -77,7 +85,7 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
   const [editStyle, setEditStyle] = useState("");
   const [editIcon, setEditIcon] = useState("⚔️");
   const [editOptions, setEditOptions] = useState<Record<string, any>>({});
-  const [editTab, setEditTab] = useState<"sliders" | "special">("sliders");
+  const [editTab, setEditTab] = useState<"all_uci" | "sliders" | "special">("all_uci");
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   // Queries
@@ -86,12 +94,41 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
     queryFn: fetchEngineList,
   });
 
-  // Query full native UCI options for active engine in edit modal
-  const { data: activeEngineAllOptions = {} } = useQuery({
+  // Query full native UCI options strictly keyed by activeEngine.id (no transposition across engines)
+  const {
+    data: activeEngineAllOptions = {},
+    isFetching: isLoadingEngineOptions,
+  } = useQuery({
     queryKey: ["engineOptions", activeEngine?.id],
     queryFn: () => (activeEngine ? fetchEngineOptions(activeEngine.id) : {}),
     enabled: !!activeEngine && isEditModalOpen,
+    staleTime: 60_000,
   });
+
+  // Query persisted Role Slot assignments (ANALYZER / SPARRING / KIBITZER / TUTOR) + hardware profile
+  const { data: engineRolesData } = useQuery({
+    queryKey: ["engineRoles"],
+    queryFn: fetchEngineRoles,
+  });
+
+  const updateRoleMutation = useMutation({
+    mutationFn: ({ role, payload }: { role: "analyzer" | "sparring" | "kibitzer" | "tutor"; payload: any }) =>
+      updateEngineRole(role, payload),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ["engineRoles"] });
+      logAction("API", `Assigned ${res.role.toUpperCase()} role to ${res.config.engine_id}`);
+    },
+  });
+
+  // Reset editOptions immediately whenever activeEngine changes or modal opens with fresh server profile
+  useEffect(() => {
+    if (activeEngine && isEditModalOpen) {
+      const fresh = engines.find((e) => e.id === activeEngine.id) || activeEngine;
+      setEditOptions({ ...(fresh.options || {}) });
+    } else if (!activeEngine) {
+      setEditOptions({});
+    }
+  }, [activeEngine?.id, isEditModalOpen, engines]);
 
   // Mutations
   const registerMutation = useMutation({
@@ -189,7 +226,7 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
     setEditStyle(engine.style);
     setEditIcon(engine.icon || "⚔️");
     setEditOptions({ ...(engine.options || {}) });
-    setEditTab("all_uci" as any);
+    setEditTab("all_uci");
     setIsEditModalOpen(true);
   };
 
@@ -200,18 +237,41 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
     setIsCloneModalOpen(true);
   };
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = (andLaunchSpar: boolean = false) => {
     if (!activeEngine) return;
-    updateMutation.mutate({
-      engineId: activeEngine.id,
-      data: {
-        name: editName,
-        elo: editElo,
-        style: editStyle,
-        icon: editIcon,
-        options: editOptions,
-      },
+    const targetId = activeEngine.id;
+    // Filter out any transposed keys not belonging to this specific engine
+    const schemaMap = (activeEngineAllOptions || {}) as Record<string, any>;
+    const validKeys = Object.keys(schemaMap);
+    const isolatedOptions: Record<string, any> = {};
+    Object.entries(editOptions || {}).forEach(([k, v]) => {
+      if (k.toLowerCase() === "multipv") return;
+      if (validKeys.length > 0 && !(k in schemaMap)) return;
+      if (schemaMap[k]?.type === "button") return;
+      isolatedOptions[k] = v;
     });
+
+    updateMutation.mutate(
+      {
+        engineId: targetId,
+        data: {
+          name: editName,
+          elo: editElo,
+          style: editStyle,
+          icon: editIcon,
+          options: isolatedOptions,
+        },
+      },
+      {
+        onSuccess: async () => {
+          await queryClient.invalidateQueries({ queryKey: ["engines"] });
+          if (andLaunchSpar && onLaunchSparring) {
+            setIsEditModalOpen(false);
+            onLaunchSparring(targetId);
+          }
+        },
+      }
+    );
   };
 
   // Filtered list
@@ -286,6 +346,179 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
         </div>
       </div>
 
+      {/* Active Engine Roles Strip (Pinned ANALYZER + SPARRING / KIBITZER / TUTOR) */}
+      {(() => {
+        const roles = engineRolesData?.roles;
+        const hw = engineRolesData?.hardware;
+        const analyzerRole = roles?.analyzer;
+        const activeAnalyzerId = analyzerRole?.engine_id || "stockfish";
+        const activeAnalyzerObj = engines.find((e) => e.id === activeAnalyzerId);
+        const presetKey = analyzerRole?.preset || "deep";
+        const presetLabel =
+          presetKey === "custom"
+            ? `Custom (d${analyzerRole?.depth ?? 18})`
+            : `${PRESET_DEFINITIONS[presetKey]?.label ?? presetKey} (${PRESET_DEFINITIONS[presetKey]?.shortDesc ?? ""})`;
+        const effWorkers = analyzerRole?.is_neural_gpu
+          ? 1
+          : analyzerRole?.workers_mode === "manual"
+          ? analyzerRole.manual_workers
+          : hw?.default_auto_workers ?? 4;
+        const effThreads = analyzerRole?.workers_mode === "manual" ? analyzerRole.manual_threads : 1;
+
+        return (
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h2 className={`text-xs font-extrabold uppercase tracking-wider flex items-center gap-1.5 ${isLight ? "text-slate-800" : "text-slate-200"}`}>
+                <Microscope className="w-4 h-4 text-amber-400" />
+                Active Engine Roles
+              </h2>
+              {hw && (
+                <span className="text-[11px] font-mono text-slate-400">
+                  Hardware Ceiling: <strong className="text-emerald-400">{hw.safe_ceiling} threads</strong> ({hw.cpu_count} logical CPUs · {(hw.available_ram_mb / 1024).toFixed(1)} GB free RAM)
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
+              {/* Primary Highlighted ANALYZER Role Tile (6 cols) */}
+              <div
+                className={`lg:col-span-6 p-4 rounded-3xl border shadow-xl flex flex-col justify-between gap-3 ${
+                  isLight
+                    ? "bg-gradient-to-br from-amber-50 to-white border-amber-300 text-slate-900"
+                    : "bg-gradient-to-br from-amber-950/30 via-[#14171c] to-emerald-950/20 border-amber-500/40 text-white"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2.5 rounded-2xl bg-amber-500/20 border border-amber-500/40 text-amber-400">
+                      <Microscope className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-black tracking-wide uppercase">ANALYZER</span>
+                        <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                          Post-Match &amp; Parallel PGN
+                        </span>
+                      </div>
+                      <span className={`text-[11px] font-mono ${isLight ? "text-slate-600" : "text-slate-400"}`}>
+                        Preset: <strong className="text-amber-400">{presetLabel}</strong> ·{" "}
+                        {analyzerRole?.is_neural_gpu
+                          ? "Neural/GPU (1w)"
+                          : `${effWorkers}w × ${effThreads}T`}
+                        {analyzerRole?.uci_overrides && Object.keys(analyzerRole.uci_overrides).length > 0
+                          ? ` · ⚙️ ${Object.keys(analyzerRole.uci_overrides).length} UCI opts`
+                          : ""}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <select
+                    value={activeAnalyzerId}
+                    onChange={(e) =>
+                      updateRoleMutation.mutate({
+                        role: "analyzer",
+                        payload: { engine_id: e.target.value },
+                      })
+                    }
+                    className={`flex-1 px-3 py-2 rounded-xl border text-xs font-mono font-bold outline-none cursor-pointer ${
+                      isLight
+                        ? "bg-white border-amber-300 text-slate-900"
+                        : "bg-black/60 border-amber-500/30 text-white"
+                    }`}
+                  >
+                    {engines.length > 0 ? (
+                      engines.map((eng) => (
+                        <option key={eng.id} value={eng.id}>
+                          {eng.icon ? `${eng.icon} ` : ""}{eng.name}
+                        </option>
+                      ))
+                    ) : (
+                      <option value={activeAnalyzerId}>{activeAnalyzerObj?.name || activeAnalyzerId}</option>
+                    )}
+                  </select>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsAnalyzerModalOpen(true)}
+                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-extrabold text-xs shadow-md flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                  >
+                    <Settings2 className="w-3.5 h-3.5" />
+                    <span>Configure Analyzer UCI</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Compact SPARRING / KIBITZER / TUTOR Summary Cards (2 cols each) */}
+              {([
+                {
+                  role: "sparring" as const,
+                  label: "SPARRING",
+                  sub: "Live Opponent",
+                  icon: <Swords className="w-4 h-4 text-rose-400" />,
+                  accent: isLight ? "border-rose-200 bg-rose-50/40" : "border-rose-500/25 bg-[#14171c]",
+                },
+                {
+                  role: "kibitzer" as const,
+                  label: "KIBITZER",
+                  sub: "Multi-PV Lines",
+                  icon: <Brain className="w-4 h-4 text-cyan-400" />,
+                  accent: isLight ? "border-cyan-200 bg-cyan-50/40" : "border-cyan-500/25 bg-[#14171c]",
+                },
+                {
+                  role: "tutor" as const,
+                  label: "TUTOR",
+                  sub: "Blunder Coach",
+                  icon: <GraduationCap className="w-4 h-4 text-emerald-400" />,
+                  accent: isLight ? "border-emerald-200 bg-emerald-50/40" : "border-emerald-500/25 bg-[#14171c]",
+                },
+              ]).map((slot) => {
+                const slotEngId = roles?.[slot.role]?.engine_id || (slot.role === "kibitzer" ? "patricia" : "stockfish");
+                return (
+                  <div
+                    key={slot.role}
+                    className={`lg:col-span-2 p-3.5 rounded-3xl border shadow-md flex flex-col justify-between gap-2 ${slot.accent}`}
+                  >
+                    <div className="flex items-center gap-2">
+                      {slot.icon}
+                      <div>
+                        <div className="text-[11px] font-black tracking-wider">{slot.label}</div>
+                        <div className={`text-[10px] font-mono ${isLight ? "text-slate-600" : "text-slate-400"}`}>{slot.sub}</div>
+                      </div>
+                    </div>
+                    <select
+                      value={slotEngId}
+                      onChange={(e) =>
+                        updateRoleMutation.mutate({
+                          role: slot.role,
+                          payload: { engine_id: e.target.value },
+                        })
+                      }
+                      className={`w-full px-2 py-1.5 rounded-xl border text-[11px] font-mono font-bold outline-none cursor-pointer ${
+                        isLight
+                          ? "bg-white border-slate-300 text-slate-900"
+                          : "bg-black/50 border-white/10 text-slate-200"
+                      }`}
+                    >
+                      {engines.length > 0 ? (
+                        engines.map((eng) => (
+                          <option key={eng.id} value={eng.id}>
+                            {eng.name}
+                          </option>
+                        ))
+                      ) : (
+                        <option value={slotEngId}>{slotEngId}</option>
+                      )}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Filter & Search Bar */}
       <div className={`p-3 rounded-2xl border flex flex-col sm:flex-row items-center justify-between gap-3 ${isLight ? "bg-white border-slate-200 shadow-sm" : "bg-[#14171c] border-white/10"}`}>
         <div className="flex items-center gap-2 w-full sm:w-80">
@@ -357,6 +590,11 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
                 </div>
 
                 <div className="flex items-center gap-1">
+                  {engineRolesData?.roles?.analyzer?.engine_id === eng.id && (
+                    <span className="text-[10px] font-mono font-extrabold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/40">
+                      ★ Analyzer
+                    </span>
+                  )}
                   {eng.is_custom ? (
                     <span className="text-[10px] font-mono font-extrabold px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-500 dark:text-rose-300 border border-rose-500/30">
                       Custom
@@ -447,16 +685,38 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
                 )}
               </div>
 
-              {onLaunchSparring && (
+              <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() => onLaunchSparring(eng.id)}
-                  className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 text-white text-xs font-extrabold transition-all flex items-center gap-1.5 cursor-pointer shadow-md shadow-rose-950/30"
-                  title="Launch Sparring match against this engine"
+                  onClick={() =>
+                    updateRoleMutation.mutate({
+                      role: "analyzer",
+                      payload: { engine_id: eng.id },
+                    })
+                  }
+                  disabled={engineRolesData?.roles?.analyzer?.engine_id === eng.id}
+                  className={`px-2.5 py-1.5 rounded-xl text-xs font-extrabold transition-all flex items-center gap-1 cursor-pointer border ${
+                    engineRolesData?.roles?.analyzer?.engine_id === eng.id
+                      ? "bg-amber-500/20 text-amber-400 border-amber-500/40 cursor-default"
+                      : isLight
+                      ? "bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300"
+                      : "bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border-amber-500/30"
+                  }`}
+                  title="Assign this engine to the dedicated post-match ANALYZER role"
                 >
-                  <Swords className="w-3.5 h-3.5" />
-                  <span>Spar</span>
+                  <Microscope className="w-3.5 h-3.5" />
+                  <span>{engineRolesData?.roles?.analyzer?.engine_id === eng.id ? "Analyzer" : "Set as Analyzer"}</span>
                 </button>
-              )}
+                {onLaunchSparring && (
+                  <button
+                    onClick={() => onLaunchSparring(eng.id)}
+                    className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 text-white text-xs font-extrabold transition-all flex items-center gap-1.5 cursor-pointer shadow-md shadow-rose-950/30"
+                    title="Launch Sparring match against this engine"
+                  >
+                    <Swords className="w-3.5 h-3.5" />
+                    <span>Spar</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         ))}
@@ -709,9 +969,9 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
                 Simple Resource Sliders
               </button>
               <button
-                onClick={() => setEditTab("all_uci" as any)}
+                onClick={() => setEditTab("all_uci")}
                 className={`px-3 py-1.5 rounded-xl transition-all cursor-pointer ${
-                  (editTab as string) === "all_uci"
+                  editTab === "all_uci"
                     ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-extrabold"
                     : "text-slate-400 hover:text-white"
                 }`}
@@ -729,6 +989,36 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
                 Special Features &amp; Modes
               </button>
             </div>
+
+            {/* TAB 0: All Native UCI Options (strictly keyed by activeEngine.id) */}
+            {editTab === "all_uci" && (
+              <div className="space-y-3">
+                {isLoadingEngineOptions ? (
+                  <div className={`p-6 rounded-2xl border text-center text-xs font-mono ${isLight ? "bg-slate-50 border-slate-200 text-slate-600" : "bg-black/30 border-white/10 text-slate-400"}`}>
+                    Querying UCI binary options from <strong>{activeEngine.name}</strong>...
+                  </div>
+                ) : Object.keys(activeEngineAllOptions).length > 0 || Object.keys(activeEngine.all_options || {}).length > 0 ? (
+                  <UciOptionsInspector
+                    key={activeEngine.id}
+                    optionsMap={Object.keys(activeEngineAllOptions).length > 0 ? activeEngineAllOptions : (activeEngine.all_options || {})}
+                    currentValues={{
+                      ...Object.fromEntries(
+                        Object.entries(Object.keys(activeEngineAllOptions).length > 0 ? activeEngineAllOptions : (activeEngine.all_options || {})).map(
+                          ([k, meta]: [string, any]) => [k, meta?.default]
+                        )
+                      ),
+                      ...editOptions,
+                    }}
+                    onChange={(key, val) => setEditOptions((prev) => ({ ...prev, [key]: val }))}
+                    isLight={isLight}
+                  />
+                ) : (
+                  <div className={`p-6 rounded-2xl border text-center text-xs font-mono ${isLight ? "bg-rose-50 border-rose-200 text-rose-700" : "bg-rose-950/30 border-rose-500/30 text-rose-300"}`}>
+                    Could not retrieve native UCI options from this engine executable. You can still configure standard resource sliders in the tab above.
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* TAB 1: Simple Sliders */}
             {editTab === "sliders" && (
@@ -885,18 +1175,36 @@ export function EnginesView({ uxTheme, onLaunchSparring }: EnginesViewProps) {
                   Cancel
                 </button>
                 <button
-                  onClick={handleSaveEdit}
+                  onClick={() => handleSaveEdit(false)}
                   disabled={updateMutation.isPending || cloneMutation.isPending}
                   className="px-5 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-extrabold rounded-xl shadow cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
                 >
                   <Check className="w-4 h-4" />
                   <span>Save UCI Configuration</span>
                 </button>
+                {onLaunchSparring && (
+                  <button
+                    onClick={() => handleSaveEdit(true)}
+                    disabled={updateMutation.isPending || cloneMutation.isPending}
+                    className="px-5 py-2 bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 text-white text-xs font-extrabold rounded-xl shadow cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    <Swords className="w-4 h-4" />
+                    <span>Save &amp; Spar</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
         </div>
       )}
+
+      {/* 4. Analyzer Role UCI & Parallelism Modal */}
+      <AnalyzerQuickSettingsModal
+        isOpen={isAnalyzerModalOpen}
+        onClose={() => setIsAnalyzerModalOpen(false)}
+        uxTheme={uxTheme}
+        mode="engine_lab"
+      />
     </div>
   );
 }

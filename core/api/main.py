@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import os
 
 from core.persistence.database import GameRepository
@@ -10,9 +11,9 @@ from core.api.sse import router as sse_router
 from core.features.dossier.router import router as dossier_router
 from core.features.openings.router import router as openings_router
 from core.features.consolidator.router import router as consolidator_router
-from core.features.database.router import router as fitness_router
+from core.features.database.router import router as fitness_router, mass_analysis_service
 from core.features.ai.router import router as ai_router
-from core.features.engine.router import router as engine_router
+from core.features.engine.router import router as engine_router, analysis_router
 from core.features.engine.companion_router import router as companion_router
 
 app = FastAPI(title="DeepScout Chess Core API", version="1.0.0")
@@ -32,6 +33,7 @@ app.include_router(consolidator_router)
 app.include_router(fitness_router)
 app.include_router(ai_router)
 app.include_router(engine_router)
+app.include_router(analysis_router)
 app.include_router(companion_router)
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,35 +79,35 @@ async def health_check():
     }
 
 @app.get("/api/v1/databases")
-async def list_databases():
+def list_databases():
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     return game_service.list_available_databases()
 
 @app.post("/api/v1/databases/ensure-default")
-async def ensure_default_database():
-    """Create sparring.sqlite as an empty database if it does not already exist on disk."""
+def ensure_default_database():
+    """Create Sparring_Games.sqlite as an empty database if it does not already exist on disk."""
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
-    sparring_path = os.path.join(game_service.root_dir, "sparring.sqlite")
+    sparring_path = os.path.join(game_service.root_dir, "Sparring_Games.sqlite")
     created = False
     if not os.path.exists(sparring_path):
         try:
             GameRepository.create_empty_db(sparring_path)
             created = True
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to create sparring.sqlite: {e}")
-    return {"created": created, "db_name": "sparring.sqlite"}
+            raise HTTPException(status_code=500, detail=f"Failed to create Sparring_Games.sqlite: {e}")
+    return {"created": created, "db_name": "Sparring_Games.sqlite"}
 
 
 @app.get("/api/v1/databases/storage")
-async def get_storage_telemetry():
+def get_storage_telemetry():
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     return game_service.get_storage_telemetry()
 
 @app.post("/api/v1/databases/trash/{db_name}")
-async def trash_database(db_name: str):
+def trash_database(db_name: str):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -116,13 +118,13 @@ async def trash_database(db_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/databases/trash")
-async def list_trash():
+def list_trash():
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     return game_service.list_trash()
 
 @app.post("/api/v1/databases/restore/{db_name}")
-async def restore_database(db_name: str):
+def restore_database(db_name: str):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -138,7 +140,7 @@ class PurgeTrashRequest(BaseModel):
     db_names: Optional[List[str]] = None
 
 @app.post("/api/v1/databases/purge")
-async def purge_trash(req: PurgeTrashRequest = PurgeTrashRequest()):
+def purge_trash(req: PurgeTrashRequest = PurgeTrashRequest()):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -147,7 +149,7 @@ async def purge_trash(req: PurgeTrashRequest = PurgeTrashRequest()):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/v1/databases/{db_name}")
-async def delete_database(db_name: str):
+def delete_database(db_name: str):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -167,7 +169,8 @@ async def upload_and_ingest_database(
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
         content = await file.read()
-        return game_service.ingest_database(
+        return await run_in_threadpool(
+            game_service.ingest_database,
             file_name=file.filename or "uploaded.pgn",
             target_name=target_name,
             file_bytes=content,
@@ -179,7 +182,7 @@ async def upload_and_ingest_database(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/databases/export-filtered")
-async def export_filtered_database(req: ExportFilteredDbRequest):
+def export_filtered_database(req: ExportFilteredDbRequest):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -199,7 +202,7 @@ async def export_filtered_database(req: ExportFilteredDbRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/databases/active")
-async def set_active_database(req: SetActiveDbRequest):
+def set_active_database(req: SetActiveDbRequest):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     try:
@@ -209,13 +212,16 @@ async def set_active_database(req: SetActiveDbRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/v1/databases/stats")
-async def get_database_stats(db_name: Optional[str] = None):
+def get_database_stats(db_name: Optional[str] = None):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
-    return game_service.get_stats(db_name)
+    try:
+        return game_service.get_stats(db_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/databases/games")
-async def list_games(
+def list_games(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     search: Optional[str] = None,
@@ -229,31 +235,37 @@ async def list_games(
 ):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
-    return game_service.list_games(
-        page=page,
-        page_size=page_size,
-        search=search,
-        white=white,
-        black=black,
-        result=result,
-        eco=eco,
-        sort_by=sort_by,
-        sort_order=sort_order,
-        db_name=db_name,
-    )
+    try:
+        return game_service.list_games(
+            page=page,
+            page_size=page_size,
+            search=search,
+            white=white,
+            black=black,
+            result=result,
+            eco=eco,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            db_name=db_name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/databases/players")
-async def list_players(
+def list_players(
     search: Optional[str] = None,
     limit: int = Query(100, ge=1, le=1000),
     db_name: Optional[str] = None,
 ):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
-    return game_service.list_players(search=search, limit=limit, db_name=db_name)
+    try:
+        return game_service.list_players(search=search, limit=limit, db_name=db_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/databases/import")
-async def import_pgn(req: PgnImportRequest):
+def import_pgn(req: PgnImportRequest):
     if not game_service:
         raise HTTPException(status_code=500, detail="GameService not initialized.")
     if not req.pgn_text.strip():
@@ -265,12 +277,68 @@ async def import_pgn(req: PgnImportRequest):
         raise HTTPException(status_code=500, detail=f"Failed to import PGN: {e}")
 
 @app.get("/api/v1/games/{game_id}")
-async def get_game(game_id: int, db_name: Optional[str] = None):
+def get_game(game_id: str, db_name: Optional[str] = None):
     if not game_service:
         raise HTTPException(status_code=500, detail="Database repository not initialized.")
-    
-    game_data = game_service.get_game(game_id, db_name)
-    if not game_data:
-        raise HTTPException(status_code=404, detail=f"Game {game_id} not found.")
-    
-    return game_data
+    try:
+        game_data = game_service.get_game(game_id, db_name)
+        if not game_data:
+            raise HTTPException(status_code=404, detail=f"Game {game_id} not found.")
+        return game_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaveVariationRequest(BaseModel):
+    db_name: Optional[str] = None
+    ply: int
+    pv_san: str
+    eval_str: Optional[str] = None
+    engine_name: Optional[str] = None
+    depth: Optional[int] = None
+
+
+@app.post("/api/v1/games/{game_id}/variations")
+def save_game_variation(game_id: str, req: SaveVariationRequest):
+    """Appends a Kibitzer variation line into the SQLite game's PGN (both _DATA_ and pgn)."""
+    if not game_service:
+        raise HTTPException(status_code=500, detail="Database repository not initialized.")
+    try:
+        return game_service.append_variation_to_game(
+            game_id=game_id,
+            ply=req.ply,
+            pv_san=req.pv_san,
+            db_name=req.db_name,
+            eval_str=req.eval_str,
+            engine_name=req.engine_name,
+            depth=req.depth,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class AnalyzeSingleGameRequest(BaseModel):
+    db_name: str
+    game_id: Union[int, str]
+    depth: int = 16
+
+@app.post("/api/v1/databases/analyze-game")
+def analyze_database_game(req: AnalyzeSingleGameRequest):
+    if not mass_analysis_service:
+        raise HTTPException(status_code=500, detail="MassAnalysisService not initialized.")
+    try:
+        return mass_analysis_service.analyze_single_game(
+            db_name=req.db_name,
+            game_id=req.game_id,
+            depth=req.depth,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

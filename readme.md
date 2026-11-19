@@ -57,3 +57,16 @@ DeepScout Chess incorporates the following open-source and public-domain assets:
 - **XPV Move Encoding Format:** Compact ASCII move encoding format originating from the Lucas Chess open-source project by Lucas Monge.
 * **License:** GNU General Public License v2.0 or later (GPL-2.0-or-later). See [LICENSE](LICENSE) for details.
 
+## FAQ: How Parallel Analysis & CPU Guardrails Work
+
+### Why does DeepScout parallelize Single-Game Analysis differently from Batch (Multi-Game) Analysis?
+DeepScout automatically switches parallelization strategies depending on whether you are analyzing one game or a whole database:
+
+* **Single-Game Analysis (Contiguous Ply Slicing):** When analyzing a single game, DeepScout splits the game's positions into contiguous blocks across $W$ independent engine workers (each configured with `Threads = 1`). Searching independent positions in parallel scales nearly linearly across your CPU cores—avoiding the 30–40% synchronization and search-tree overlap penalty that occurs when a single engine runs multi-threaded alpha-beta search (Lazy SMP) on one position at a time. Keeping slices contiguous also allows each worker to reuse its Transposition Table (Hash) from move to move.
+* **Batch / Multi-Game Analysis (1 Full Game per Worker):** When analyzing multiple games at once, DeepScout assigns one complete game per worker rather than slicing individual games. Each worker keeps its Transposition Table warm from move 1 through the endgame with zero chunk-boundary resets, maximizing throughput across the batch.
+
+### What is the "Auto (Hardware Safe)" CPU ceiling?
+By default, DeepScout detects your system's logical CPU count at runtime and reserves **2 logical threads** for Windows, the Tauri desktop interface, and database I/O (for example, capping active analysis workers at **6 threads** on an 8-thread CPU). 
+
+* **GPU / Neural Engines (Lc0, Maia):** Neural engines are automatically capped at `1 worker` so multiple processes do not compete for GPU VRAM or BLAS threads.
+* **Manual Override & Oversubscription Guardrail:** Power users can expand **Advanced Parallelism & Hardware** inside the Analyzer settings (or the ⚙️ quick-settings modal) to manually adjust **Workers** and **Threads per Worker**. If `Workers × Threads` exceeds your safe hardware ceiling, DeepScout displays a non-blocking red warning banner alongside a one-click **Auto-Balance** button—letting you override limits intentionally without risking accidental UI freezes.

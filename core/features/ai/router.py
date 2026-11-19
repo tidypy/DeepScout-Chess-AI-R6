@@ -32,31 +32,31 @@ class ProfileUpdateRequest(BaseModel):
     content: str
 
 @router.get("/config")
-async def get_config():
+def get_config():
     return ai_service.get_config()
 
 @router.post("/config")
-async def update_config(req: ConfigUpdateRequest):
+def update_config(req: ConfigUpdateRequest):
     return ai_service.save_config(req.dict())
 
 @router.get("/personas")
-async def get_personas():
+def get_personas():
     return ai_service.get_personas()
 
 @router.get("/profile")
-async def get_profile():
+def get_profile():
     return {"profile": ai_service.get_profile()}
 
 @router.post("/profile")
-async def update_profile(req: ProfileUpdateRequest):
+def update_profile(req: ProfileUpdateRequest):
     return {"profile": ai_service.update_profile(req.content)}
 
 @router.post("/test-connection")
-async def test_connection(req: TestConnectionRequest):
+def test_connection(req: TestConnectionRequest):
     return ai_service.test_connection(req.backend_type, req.base_url, req.api_key)
 
 @router.post("/commentary")
-async def generate_commentary(req: CommentaryRequest):
+def generate_commentary(req: CommentaryRequest):
     result = ai_service.generate_commentary(
         fen=req.fen,
         eval_str=req.eval_str,

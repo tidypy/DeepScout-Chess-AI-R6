@@ -1,6 +1,5 @@
 import os
 import uuid
-import asyncio
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -23,6 +22,9 @@ class SanitizeRequest(BaseModel):
 class SilverStatsRequest(BaseModel):
     db_name: str
 
+class RepairSparringRequest(BaseModel):
+    db_name: str = "Sparring_Games.sqlite"
+
 class MassAnalysisRequest(BaseModel):
     db_name: str
     depth: int = 16
@@ -30,7 +32,7 @@ class MassAnalysisRequest(BaseModel):
     max_games: Optional[int] = None
 
 @router.get("/audit")
-async def audit_database(db_name: str = Query("patriciaTourny.sqlite")):
+def audit_database(db_name: str = Query("patriciaTourny.sqlite")):
     try:
         return fitness_service.audit_database(db_name)
     except FileNotFoundError:
@@ -39,7 +41,7 @@ async def audit_database(db_name: str = Query("patriciaTourny.sqlite")):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/sanitize")
-async def sanitize_database(req: SanitizeRequest):
+def sanitize_database(req: SanitizeRequest):
     try:
         return fitness_service.clean_and_sanitize(
             db_name=req.db_name,
@@ -50,15 +52,25 @@ async def sanitize_database(req: SanitizeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/repair-sparring")
+def repair_sparring_database(req: RepairSparringRequest = RepairSparringRequest()):
+    """Backfills missing SQL columns from PGN, repairs mangled engine names, and fixes Silver/Gold tiers."""
+    try:
+        return fitness_service.repair_sparring_database(req.db_name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Database {req.db_name} not found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/generate-silver-stats")
-async def generate_silver_statistics(req: SilverStatsRequest):
+def generate_silver_statistics(req: SilverStatsRequest):
     try:
         return fitness_service.generate_silver_statistics(req.db_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/mass-analysis/start")
-async def start_mass_analysis(req: MassAnalysisRequest, background_tasks: BackgroundTasks):
+def start_mass_analysis(req: MassAnalysisRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())[:8]
     background_tasks.add_task(
         mass_analysis_service.run_mass_analysis,
@@ -71,10 +83,10 @@ async def start_mass_analysis(req: MassAnalysisRequest, background_tasks: Backgr
     return {"status": "started", "job_id": job_id, "db_name": req.db_name}
 
 @router.get("/mass-analysis/status/{job_id}")
-async def get_analysis_status(job_id: str):
+def get_analysis_status(job_id: str):
     return mass_analysis_service.get_analysis_status(job_id)
 
 @router.post("/mass-analysis/cancel/{job_id}")
-async def cancel_analysis(job_id: str):
+def cancel_analysis(job_id: str):
     cancelled = mass_analysis_service.cancel_analysis(job_id)
     return {"status": "cancelled" if cancelled else "not_found", "job_id": job_id}

@@ -6,6 +6,7 @@ import {
   fetchGamesList,
   setActiveDatabase,
   importPgn,
+  analyzeDatabaseGame,
   GameSummary,
 } from "../../lib/api";
 import { useClickLogger } from "../../lib/clickLogger";
@@ -23,26 +24,37 @@ import {
   Check,
   X,
   FileText,
+  Sparkles,
+  ShieldCheck,
+  Zap,
+  AlertTriangle,
 } from "lucide-react";
 
 interface DatabaseWorkspaceProps {
-  onLoadGame: (gameId: number, dbName?: string) => void;
+  onLoadGame: (gameId: number | string, dbName?: string) => void;
   uxTheme: UXTheme;
+  /** When set, the workspace is scoped to this database (no active-DB switcher) and shows a Back button. */
+  dbName?: string;
+  onBack?: () => void;
 }
 
-export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProps) {
+export function DatabaseWorkspace({ onLoadGame, uxTheme, dbName, onBack }: DatabaseWorkspaceProps) {
   const { logAction } = useClickLogger();
   const queryClient = useQueryClient();
   const isLight = uxTheme.mode === "light";
 
   // Filter and pagination state
   const [page, setPage] = useState(1);
-  const [pageSize] = useState(25);
+  const [pageSize, setPageSize] = useState(25);
   const [search, setSearch] = useState("");
   const [resultFilter, setResultFilter] = useState("");
+  const [tierFilter, setTierFilter] = useState("ALL");
   const [ecoFilter, setEcoFilter] = useState("");
+  const [whiteFilter, setWhiteFilter] = useState("");
+  const [blackFilter, setBlackFilter] = useState("");
   const [sortBy, setSortBy] = useState("ROWID");
   const [sortOrder, setSortOrder] = useState<"ASC" | "DESC">("ASC");
+  const [analyzingGameId, setAnalyzingGameId] = useState<number | string | null>(null);
 
   // PGN Import Modal
   const [isImportOpen, setIsImportOpen] = useState(false);
@@ -56,26 +68,33 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
   });
 
   const { data: stats, refetch: refetchStats } = useQuery({
-    queryKey: ["dbStats"],
-    queryFn: () => fetchDatabaseStats(),
+    queryKey: ["dbStats", dbName ?? "active"],
+    queryFn: () => fetchDatabaseStats(dbName),
   });
 
   const {
     data: gamesData,
     isLoading: isLoadingGames,
+    isError: isGamesError,
+    error: gamesError,
     refetch: refetchGames,
   } = useQuery({
-    queryKey: ["gamesList", page, pageSize, search, resultFilter, ecoFilter, sortBy, sortOrder],
+    queryKey: ["gamesList", dbName ?? "active", page, pageSize, search, resultFilter, ecoFilter, whiteFilter, blackFilter, sortBy, sortOrder],
     queryFn: () =>
       fetchGamesList({
         page,
         page_size: pageSize,
         search,
+        white: whiteFilter || undefined,
+        black: blackFilter || undefined,
         result: resultFilter || undefined,
         eco: ecoFilter || undefined,
         sort_by: sortBy,
         sort_order: sortOrder,
+        db_name: dbName,
       }),
+    retry: 2,
+    retryDelay: 1000,
   });
 
   // Switch Active Database Mutation
@@ -92,7 +111,7 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
 
   // Import PGN Mutation
   const importMutation = useMutation({
-    mutationFn: (text: string) => importPgn(text),
+    mutationFn: (text: string) => importPgn(text, dbName),
     onSuccess: (data) => {
       logAction("API", `Successfully imported ${data.imported_count} games`);
       setImportStatus(`Imported ${data.imported_count} game(s) successfully!`);
@@ -121,7 +140,25 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
 
   const handleSelectGame = (game: GameSummary) => {
     logAction("CLICK", `Loaded Game #${game.id}: ${game.WHITE} vs ${game.BLACK}`);
-    onLoadGame(game.id);
+    onLoadGame(game.id, dbName);
+  };
+
+  const handleAnalyzeGame = async (e: React.MouseEvent, game: GameSummary) => {
+    e.stopPropagation();
+    const targetDb = dbName || (stats as any)?.database_name || "Miniatures.sqlite";
+    setAnalyzingGameId(game.id);
+    logAction("API", `Triggered Single Game Gold Analysis for Game #${game.id} in ${targetDb}`);
+    try {
+      await analyzeDatabaseGame(targetDb, game.id);
+      queryClient.invalidateQueries({ queryKey: ["gamesList"] });
+      queryClient.invalidateQueries({ queryKey: ["dbStats"] });
+      queryClient.invalidateQueries({ queryKey: ["databases"] });
+      queryClient.invalidateQueries({ queryKey: ["fitnessAudit"] });
+    } catch (err: any) {
+      console.error("Game analysis failed:", err);
+    } finally {
+      setAnalyzingGameId(null);
+    }
   };
 
   return (
@@ -131,12 +168,25 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
         className={`p-5 rounded-3xl border flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-xl ${uxTheme.panel} ${uxTheme.border}`}
       >
         <div className="flex items-center gap-3">
+          {dbName && onBack && (
+            <button
+              onClick={() => {
+                logAction("NAV", `Closed full database view: ${dbName}`);
+                onBack();
+              }}
+              className="px-3 py-2 rounded-xl text-xs font-bold border flex items-center gap-1.5 bg-black/30 hover:bg-white/10 border-white/10 text-slate-200 cursor-pointer"
+              title="Back to Database Hub"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              Back to Hub
+            </button>
+          )}
           <div className="p-3 bg-emerald-500/10 text-emerald-500 rounded-2xl border border-emerald-500/20">
             <Database className="w-6 h-6" />
           </div>
           <div>
             <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-              SQLite Database Explorer
+              {dbName ? "Database Explorer" : "SQLite Database Explorer"}
               {stats && (
                 <span className="text-xs font-mono px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
                   {stats.total_games.toLocaleString()} Games
@@ -144,14 +194,14 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
               )}
             </h2>
             <p className="text-xs opacity-70">
-              Active Database: <span className="font-mono font-bold text-emerald-400">{stats?.path || "patriciaTourny.sqlite"}</span>
+              {dbName ? "Database" : "Active Database"}: <span className="font-mono font-bold text-emerald-400">{dbName || stats?.path || "patriciaTourny.sqlite"}</span>
             </p>
           </div>
         </div>
 
         {/* Database Switcher & Import Action */}
         <div className="flex items-center gap-2.5 flex-wrap">
-          {databases?.map((db) => (
+          {!dbName && databases?.map((db) => (
             <Tooltip key={db.name} content={`Switch to ${db.name} (${db.size_mb} MB)`}>
               <button
                 onClick={() => switchDbMutation.mutate(db.name)}
@@ -242,6 +292,73 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
               <option value="1/2-1/2">1/2-1/2 (Draw)</option>
             </select>
 
+            {/* Data Fitness Tier Filter */}
+            <select
+              value={tierFilter}
+              onChange={(e) => {
+                setTierFilter(e.target.value);
+                setPage(1);
+                logAction("CLICK", `Filtered by Data Tier: ${e.target.value}`);
+              }}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                isLight
+                  ? "bg-white border-slate-200 text-slate-700"
+                  : "bg-black/40 border-white/10 text-slate-300"
+              }`}
+              title="Filter by Data Fitness Tier"
+            >
+              <option value="ALL">All Tiers</option>
+              <option value="GOLD">🔥 Gold Tier (Evaluated)</option>
+              <option value="SILVER">🛡️ Silver Tier (ECO & Elo)</option>
+              <option value="BRONZE">🥉 Bronze Tier (Sanitized)</option>
+              <option value="RAW">⚠️ Raw / Quarantine</option>
+            </select>
+
+            {/* White / Black player filters */}
+            {(["White", "Black"] as const).map((side) => {
+              const val = side === "White" ? whiteFilter : blackFilter;
+              const setVal = side === "White" ? setWhiteFilter : setBlackFilter;
+              return (
+                <div
+                  key={side}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border ${
+                    isLight ? "bg-white border-slate-200" : "bg-black/30 border-white/10"
+                  }`}
+                >
+                  <span className="text-[10px] font-bold opacity-60">{side}</span>
+                  <input
+                    type="text"
+                    placeholder="player"
+                    value={val}
+                    onChange={(e) => {
+                      setVal(e.target.value);
+                      setPage(1);
+                    }}
+                    className="bg-transparent border-0 text-xs focus:outline-none w-24"
+                  />
+                </div>
+              );
+            })}
+
+            {/* Page size */}
+            <select
+              value={pageSize}
+              onChange={(e) => {
+                setPageSize(parseInt(e.target.value, 10));
+                setPage(1);
+              }}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                isLight ? "bg-white border-slate-200 text-slate-700" : "bg-black/40 border-white/10 text-slate-300"
+              }`}
+              title="Rows per page"
+            >
+              {[25, 50, 100, 250].map((n) => (
+                <option key={n} value={n}>
+                  {n} / page
+                </option>
+              ))}
+            </select>
+
             {/* ECO Filter */}
             <div
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border ${
@@ -284,7 +401,26 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
           {isLoadingGames ? (
             <div className="h-64 flex items-center justify-center gap-2 opacity-60">
               <RefreshCw className="w-5 h-5 animate-spin text-emerald-500" />
-              <span className="text-xs font-mono">Loading records from SQLite WAL...</span>
+              <span className="text-xs font-mono">Loading records...</span>
+            </div>
+          ) : isGamesError ? (
+            <div className="h-64 flex flex-col items-center justify-center gap-3 text-center px-4">
+              <div className="p-3 bg-rose-500/10 text-rose-400 rounded-2xl border border-rose-500/20">
+                <FileText className="w-6 h-6 opacity-80" />
+              </div>
+              <div className="text-xs font-semibold text-rose-400">
+                Failed to load records from {dbName || "database"}
+              </div>
+              <p className="text-[11px] text-slate-400 max-w-sm">
+                {(gamesError as Error)?.message || "The database may be busy or temporarily locked."}
+              </p>
+              <button
+                onClick={() => refetchGames()}
+                className="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md transition-colors cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Retry
+              </button>
             </div>
           ) : !gamesData || gamesData.games.length === 0 ? (
             <div className="h-64 flex flex-col items-center justify-center gap-2 opacity-60">
@@ -303,10 +439,11 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
                 >
                   <th
                     onClick={() => handleSort("ROWID")}
-                    className="py-3 px-4 cursor-pointer hover:text-emerald-500 w-16"
+                    className="py-3 px-3 cursor-pointer hover:text-emerald-500 w-14"
                   >
                     # {sortBy === "ROWID" && (sortOrder === "ASC" ? "↑" : "↓")}
                   </th>
+                  <th className="py-3 px-3 text-center w-28">Fitness Tier</th>
                   <th
                     onClick={() => handleSort("WHITE")}
                     className="py-3 px-4 cursor-pointer hover:text-emerald-500"
@@ -337,6 +474,10 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
                   >
                     Opening {sortBy === "OPENING" && (sortOrder === "ASC" ? "↑" : "↓")}
                   </th>
+                  <th className="py-3 px-3 font-mono text-center w-20">ACPL</th>
+                  <th className="py-3 px-3 font-mono text-center w-20">Accuracy</th>
+                  <th className="py-3 px-3 font-mono text-center w-16">Eval</th>
+                  <th className="py-3 px-4 hidden lg:table-cell">Event</th>
                   <th
                     onClick={() => handleSort("DATE")}
                     className="py-3 px-3 cursor-pointer hover:text-emerald-500 w-24 hidden sm:table-cell"
@@ -349,77 +490,212 @@ export function DatabaseWorkspace({ onLoadGame, uxTheme }: DatabaseWorkspaceProp
                   >
                     Plies {sortBy === "PLYCOUNT" && (sortOrder === "ASC" ? "↑" : "↓")}
                   </th>
-                  <th className="py-3 px-3 w-16 text-center">Action</th>
+                  <th className="py-3 px-3 w-28 text-center">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
-                {gamesData.games.map((g) => (
-                  <tr
-                    key={g.id}
-                    onClick={() => handleSelectGame(g)}
-                    className={`cursor-pointer transition-colors duration-100 group ${
-                      isLight
-                        ? "hover:bg-emerald-50 text-slate-800"
-                        : "hover:bg-white/5 text-slate-200"
-                    }`}
-                  >
-                    <td className="py-2.5 px-4 font-mono opacity-50">{g.id}</td>
-                    <td className="py-2.5 px-4 font-semibold group-hover:text-emerald-500 transition-colors">
-                      {g.WHITE}
-                      {g.WHITEELO && (
-                        <span className="text-[10px] opacity-60 font-mono ml-1.5 font-normal">
-                          ({g.WHITEELO})
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-4 font-semibold group-hover:text-emerald-500 transition-colors">
-                      {g.BLACK}
-                      {g.BLACKELO && (
-                        <span className="text-[10px] opacity-60 font-mono ml-1.5 font-normal">
-                          ({g.BLACKELO})
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-3 font-mono font-bold text-center">
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          g.RESULT === "1-0"
-                            ? "bg-emerald-500/20 text-emerald-500 border border-emerald-500/30"
-                            : g.RESULT === "0-1"
-                            ? "bg-rose-500/20 text-rose-500 border border-rose-500/30"
-                            : "bg-slate-500/20 text-slate-400 border border-slate-500/30"
+                {(gamesData.games ?? [])
+                  .filter((g) => tierFilter === "ALL" || g.tier?.toUpperCase() === tierFilter.toUpperCase())
+                  .map((g) => {
+                    const isAnalyzing = analyzingGameId === g.id;
+                    return (
+                      <tr
+                        key={g.id}
+                        onClick={() => handleSelectGame(g)}
+                        className={`cursor-pointer transition-colors duration-100 group ${
+                          isLight
+                            ? "hover:bg-emerald-50 text-slate-800"
+                            : "hover:bg-white/5 text-slate-200"
                         }`}
                       >
-                        {g.RESULT}
-                      </span>
-                    </td>
-                    <td className="py-2.5 px-3 font-mono font-bold text-emerald-400 opacity-90">
-                      {g.ECO || "—"}
-                    </td>
-                    <td className="py-2.5 px-4 opacity-80 truncate max-w-xs hidden md:table-cell">
-                      {g.OPENING || "—"}
-                    </td>
-                    <td className="py-2.5 px-3 opacity-60 font-mono hidden sm:table-cell">
-                      {g.DATE || "—"}
-                    </td>
-                    <td className="py-2.5 px-3 font-mono text-center opacity-70">
-                      {g.PLYCOUNT || "—"}
-                    </td>
-                    <td className="py-2.5 px-3 text-center">
-                      <Tooltip content="Open Game in Analysis Board">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleSelectGame(g);
-                          }}
-                          className="p-1 rounded-lg bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-slate-950 transition-colors"
-                        >
-                          <Play className="w-3.5 h-3.5" />
-                        </button>
-                      </Tooltip>
-                    </td>
-                  </tr>
-                ))}
+                        <td className="py-2.5 px-3 font-mono opacity-50 text-[11px]">{g.id}</td>
+
+                        {/* Data Fitness Tier Status Badge */}
+                        <td className="py-2.5 px-3 text-center">
+                          {g.tier === "Gold" ? (
+                            <Tooltip content="Gold Standard Verified: Evaluated with Stockfish (ACPL + CAPS Accuracy)">
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/40 inline-flex items-center gap-1 shadow-sm">
+                                <Sparkles className="w-3 h-3 text-amber-400" />
+                                Gold
+                              </span>
+                            </Tooltip>
+                          ) : g.tier === "Silver" ? (
+                            <Tooltip content="Silver Tier: Verified ECO and Elo. Click to upgrade to Gold Standard!">
+                              <button
+                                onClick={(e) => handleAnalyzeGame(e, g)}
+                                disabled={isAnalyzing}
+                                className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-slate-400/15 hover:bg-amber-500/20 text-slate-300 hover:text-amber-300 border border-slate-400/30 hover:border-amber-500/40 inline-flex items-center gap-1 cursor-pointer transition-all"
+                              >
+                                {isAnalyzing ? (
+                                  <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
+                                ) : (
+                                  <ShieldCheck className="w-3 h-3 text-slate-400" />
+                                )}
+                                Silver
+                              </button>
+                            </Tooltip>
+                          ) : g.tier === "Bronze" ? (
+                            <Tooltip content="Bronze Tier: Sanitized metadata. Click to analyze with Stockfish!">
+                              <button
+                                onClick={(e) => handleAnalyzeGame(e, g)}
+                                disabled={isAnalyzing}
+                                className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-orange-500/15 hover:bg-amber-500/20 text-orange-300 hover:text-amber-300 border border-orange-500/30 hover:border-amber-500/40 inline-flex items-center gap-1 cursor-pointer transition-all"
+                              >
+                                {isAnalyzing ? (
+                                  <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
+                                ) : (
+                                  <Zap className="w-3 h-3 text-orange-400" />
+                                )}
+                                Bronze
+                              </button>
+                            </Tooltip>
+                          ) : (
+                            <Tooltip content="Raw Tier: Unverified record. Click to analyze!">
+                              <button
+                                onClick={(e) => handleAnalyzeGame(e, g)}
+                                disabled={isAnalyzing}
+                                className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-rose-500/15 hover:bg-amber-500/20 text-rose-300 hover:text-amber-300 border border-rose-500/30 hover:border-amber-500/40 inline-flex items-center gap-1 cursor-pointer transition-all"
+                              >
+                                {isAnalyzing ? (
+                                  <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
+                                ) : (
+                                  <AlertTriangle className="w-3 h-3 text-rose-400" />
+                                )}
+                                Raw
+                              </button>
+                            </Tooltip>
+                          )}
+                        </td>
+
+                        <td className="py-2.5 px-4 font-semibold group-hover:text-emerald-500 transition-colors">
+                          {g.WHITE}
+                          {g.WHITEELO && (
+                            <span className="text-[10px] opacity-60 font-mono ml-1.5 font-normal">
+                              ({g.WHITEELO})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 font-semibold group-hover:text-emerald-500 transition-colors">
+                          {g.BLACK}
+                          {g.BLACKELO && (
+                            <span className="text-[10px] opacity-60 font-mono ml-1.5 font-normal">
+                              ({g.BLACKELO})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono font-bold text-center">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] ${
+                              g.RESULT === "1-0"
+                                ? "bg-emerald-500/20 text-emerald-500 border border-emerald-500/30"
+                                : g.RESULT === "0-1"
+                                ? "bg-rose-500/20 text-rose-500 border border-rose-500/30"
+                                : "bg-slate-500/20 text-slate-400 border border-slate-500/30"
+                            }`}
+                          >
+                            {g.RESULT}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 font-mono font-bold text-emerald-400 opacity-90">
+                          {g.ECO || "—"}
+                        </td>
+                        <td className="py-2.5 px-4 opacity-80 truncate max-w-xs hidden md:table-cell">
+                          {g.OPENING || "—"}
+                        </td>
+
+                        {/* ACPL Column */}
+                        <td className="py-2.5 px-3 font-mono text-center text-[11px]">
+                          {g.acpl ? (
+                            <span className="font-bold text-emerald-400">{g.acpl}</span>
+                          ) : (
+                            <Tooltip content="ACPL missing — Click to analyze and calculate centipawn loss">
+                              <button
+                                onClick={(e) => handleAnalyzeGame(e, g)}
+                                disabled={isAnalyzing}
+                                className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 font-semibold cursor-pointer"
+                              >
+                                {isAnalyzing ? "..." : "+ Add"}
+                              </button>
+                            </Tooltip>
+                          )}
+                        </td>
+
+                        {/* Accuracy % Column */}
+                        <td className="py-2.5 px-3 font-mono text-center text-[11px]">
+                          {g.accuracy ? (
+                            <span className="font-bold text-blue-400">{g.accuracy}</span>
+                          ) : (
+                            <span className="opacity-30">—</span>
+                          )}
+                        </td>
+
+                        {/* Final Eval Column */}
+                        <td className="py-2.5 px-3 font-mono text-center text-[11px]">
+                          {g.final_eval ? (
+                            <span
+                              className={`font-semibold ${
+                                g.final_eval.startsWith("+")
+                                  ? "text-emerald-400"
+                                  : g.final_eval.startsWith("-")
+                                  ? "text-rose-400"
+                                  : "opacity-70"
+                              }`}
+                            >
+                              {g.final_eval}
+                            </span>
+                          ) : (
+                            <span className="opacity-30">—</span>
+                          )}
+                        </td>
+
+                        <td className="py-2.5 px-4 opacity-70 truncate max-w-[12rem] hidden lg:table-cell" title={g.EVENT}>
+                          {g.EVENT || "—"}
+                        </td>
+                        <td className="py-2.5 px-3 opacity-60 font-mono hidden sm:table-cell">
+                          {g.DATE || "—"}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono text-center opacity-70">
+                          {g.PLYCOUNT || "—"}
+                        </td>
+
+                        {/* Action Column */}
+                        <td className="py-2.5 px-3 text-center">
+                          <div className="flex items-center justify-center gap-1.5">
+                            {/* If game is not yet Gold, render Analyze button */}
+                            {g.tier !== "Gold" && (
+                              <Tooltip content="Analyze with Stockfish (Unlock Gold Standard)">
+                                <button
+                                  onClick={(e) => handleAnalyzeGame(e, g)}
+                                  disabled={isAnalyzing}
+                                  className="px-2 py-0.5 rounded-lg bg-gradient-to-r from-amber-600 to-yellow-500 hover:from-amber-500 hover:to-yellow-400 text-slate-950 font-bold text-[10px] shadow flex items-center gap-1 cursor-pointer transition-all disabled:opacity-50"
+                                >
+                                  {isAnalyzing ? (
+                                    <RefreshCw className="w-3 h-3 animate-spin text-slate-950" />
+                                  ) : (
+                                    <Sparkles className="w-3 h-3 text-slate-950" />
+                                  )}
+                                  Analyze
+                                </button>
+                              </Tooltip>
+                            )}
+
+                            {/* Open Game in Analysis Board */}
+                            <Tooltip content="Open Game in Full Analysis Board">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSelectGame(g);
+                                }}
+                                className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-slate-950 transition-colors cursor-pointer"
+                              >
+                                <Play className="w-3.5 h-3.5" />
+                              </button>
+                            </Tooltip>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           )}

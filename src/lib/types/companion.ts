@@ -43,7 +43,7 @@ export interface KibitzerVariationRecord {
   saved_at: string;
 }
 
-export type TutorFlagType = "user_blunder" | "engine_blunder" | "tactic" | "best_move_available";
+export type TutorFlagType = "user_blunder" | "engine_blunder" | "tactic" | "best_move_available" | "mistake" | "mate_alert";
 export type TutorOutcome = "accepted_suggestion" | "played_own_move" | "ignored_flag";
 export type TutorTriggerSource = "continuous" | "polling" | "flag_triggered";
 

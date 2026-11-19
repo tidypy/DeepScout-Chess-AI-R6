@@ -22,7 +22,7 @@ def get_dossier_service(db_name: Optional[str] = None) -> DossierService:
     return DossierService(db_path)
 
 @router.get("/player/{player_name}")
-async def get_player_dossier(
+def get_player_dossier(
     player_name: str,
     time_control: str = Query("All"),
     date_range: str = Query("All"),
@@ -35,7 +35,7 @@ async def get_player_dossier(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/compare")
-async def compare_players(
+def compare_players(
     player_a: str = Query("Carlsen,M"),
     player_b: str = Query("Bu Xiangzhi"),
     db_name: Optional[str] = None,

@@ -3,7 +3,7 @@ import { VariationLine } from "./types/companion";
 export const API_BASE = "http://127.0.0.1:8000/api/v1";
 
 export interface GameSummary {
-  id: number;
+  id: number | string;
   WHITE: string;
   BLACK: string;
   RESULT: string;
@@ -14,6 +14,59 @@ export interface GameSummary {
   PLYCOUNT: number;
   WHITEELO?: string;
   BLACKELO?: string;
+  tier?: "Gold" | "Silver" | "Bronze" | "Raw";
+  acpl?: string | number | null;
+  accuracy?: string | null;
+  final_eval?: string | null;
+  engine?: string | null;
+  depth?: string | null;
+  has_gold_eval?: boolean;
+  has_silver_stats?: boolean;
+}
+
+export interface AnalyzeGameResponse {
+  success: boolean;
+  game_id: number | string;
+  tier: "Gold" | "Silver" | "Bronze" | "Raw" | string;
+  acpl?: string | null;
+  accuracy?: string | null;
+  final_eval?: string | null;
+  engine?: string | null;
+  depth?: string | null;
+  error?: string;
+}
+
+export class ApiHttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiHttpError";
+    this.status = status;
+  }
+}
+
+export interface GameRecord {
+  id: number | string;
+  rowid?: number | null;
+  prev_id?: number | null;
+  next_id?: number | null;
+  white: string;
+  black: string;
+  result: string;
+  date: string;
+  event: string;
+  eco: string;
+  opening: string;
+  plycount: number;
+  white_elo: string;
+  black_elo: string;
+  initial_fen: string;
+  pgn: string;
+  termination?: string | null;
+  final_eval?: string | null;
+  eval_source?: string | null;
+  player_acpl?: number | null;
+  engine_acpl?: number | null;
 }
 
 export interface GameListResponse {
@@ -48,11 +101,57 @@ export const fetchHealth = async () => {
   return res.json();
 };
 
-export const fetchGame = async (id: number, dbName?: string) => {
+export const fetchGame = async (id: number | string, dbName?: string): Promise<GameRecord> => {
   const url = new URL(`${API_BASE}/games/${id}`);
   if (dbName) url.searchParams.set("db_name", dbName);
   const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Game #${id} not found`);
+  if (!res.ok) {
+    let detail = `Game #${id} not found`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {}
+    throw new ApiHttpError(detail, res.status);
+  }
+  return res.json();
+};
+
+export interface SaveVariationToPgnPayload {
+  db_name?: string;
+  ply: number;
+  pv_san: string;
+  eval_str?: string;
+  engine_name?: string;
+  depth?: number;
+}
+
+export interface SaveVariationToPgnResponse {
+  success: boolean;
+  game_id: number | string;
+  db_name: string;
+  ply: number;
+  moves_saved: number;
+  already_existed: boolean;
+  pgn: string;
+}
+
+export const saveVariationToGamePgn = async (
+  gameId: number | string,
+  payload: SaveVariationToPgnPayload
+): Promise<SaveVariationToPgnResponse> => {
+  const res = await fetch(`${API_BASE}/games/${encodeURIComponent(String(gameId))}/variations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    let detail = "Failed to save variation into SQLite PGN";
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {}
+    throw new ApiHttpError(detail, res.status);
+  }
   return res.json();
 };
 
@@ -427,6 +526,23 @@ export const cancelMassAnalysis = async (jobId: string) => {
   return res.json();
 };
 
+export const analyzeDatabaseGame = async (
+  dbName: string,
+  gameId: number | string,
+  depth: number = 16
+): Promise<AnalyzeGameResponse> => {
+  const res = await fetch(`${API_BASE}/databases/analyze-game`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ db_name: dbName, game_id: gameId, depth }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to analyze game");
+  }
+  return res.json();
+};
+
 // ----------------------------------------------------
 // Analytics (Dossier, Compare, Fashion Index) APIs
 // ----------------------------------------------------
@@ -504,6 +620,8 @@ export interface EnginePlayRequest {
   elo?: number;
   time_limit_ms?: number;
   depth?: number;
+  threads?: number;
+  hash_mb?: number;
   book_name?: string;
   use_book?: boolean;
 }
@@ -588,9 +706,12 @@ export const fetchOpeningBooksList = async (): Promise<OpeningBookInfo[]> => {
 };
 
 export const probeOpeningBook = async (fen: string, bookName?: string): Promise<OpeningBookProbeResult> => {
+  if (bookName === "none" || bookName === "engine_native") {
+    return { in_book: false, candidates: [] };
+  }
   const url = new URL(`${API_BASE}/openings/books/probe`);
   url.searchParams.set("fen", fen);
-  if (bookName && bookName !== "none") {
+  if (bookName) {
     url.searchParams.set("book_name", bookName);
   }
   const res = await fetch(url.toString());
@@ -613,14 +734,22 @@ export const fetchEngineEvaluate = async (payload: {
   engine_id?: string;
   depth?: number;
   time_limit_ms?: number;
+  subsystem?: string;
 }): Promise<{
   success: boolean;
   eval_score: string;
   eval_cp: number;
+  /** Side-to-move POV centipawns, mate-normalised (+/-(10000 - 100*|mate|)). Absent on older sidecars. */
+  stm_cp?: number;
+  is_mate?: boolean;
+  /** Mate distance from the side-to-move POV (positive = side to move mates). */
+  mate_in?: number | null;
   best_move_san: string;
   best_move_uci: string;
   main_line: string;
   depth: number;
+  uci_log?: string[];
+  error?: string;
 }> => {
   const res = await fetch(`${API_BASE}/engine/evaluate`, {
     method: "POST",
@@ -630,6 +759,7 @@ export const fetchEngineEvaluate = async (payload: {
   if (!res.ok) throw new Error("Failed to evaluate position");
   return res.json();
 };
+
 
 export interface UciOptionInfo {
   name: string;
@@ -861,5 +991,357 @@ export const fetchEngineVariations = async (payload: {
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error("Failed to fetch engine variations");
+  return res.json();
+};
+
+// -----------------------------------------------------------------------------
+// DSD-46: Polyglot SQLite Candidate Book Query
+// -----------------------------------------------------------------------------
+
+export interface BookCandidate {
+  move_uci: string;
+  move_san: string | null;
+  weight: number;
+  popularity_pct: number;
+  eval_cp?: number | null;
+  acpl?: number | null;
+  avg_elo?: number | null;
+}
+
+export const fetchBookCandidates = async (
+  fen: string,
+  bookDb: string
+): Promise<BookCandidate[]> => {
+  const url = new URL(`${API_BASE}/openings/candidates`);
+  url.searchParams.set("fen", fen);
+  url.searchParams.set("book_db", bookDb);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error("Failed to fetch book candidates");
+  return res.json();
+};
+
+// -----------------------------------------------------------------------------
+// DSD-44: Repertoire Edge Ingestion Client
+// -----------------------------------------------------------------------------
+
+export interface RepertoireEdgePayload {
+  book_db: string;
+  fen: string;
+  move_uci: string;
+  move_san: string;
+  source: "USER" | "KIBITZER" | "TUTOR" | "BOOK";
+  is_provocation?: boolean;
+  commentary?: string;
+}
+
+export async function saveRepertoireEdge(
+  payload: RepertoireEdgePayload
+): Promise<{ success: boolean; message?: string }> {
+  const res = await fetch(`${API_BASE}/openings/repertoire/edge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to save repertoire edge");
+  return res.json();
+}
+
+// -----------------------------------------------------------------------------
+// DSD-51: Telemetry Flush & Deterministic Adjudication Engine
+// -----------------------------------------------------------------------------
+
+export interface TelemetryFlushPayload {
+  game_id: string;
+  pgn: string;
+  player_color: "white" | "black";
+  termination_type:
+    | "EVAL_ADJUDICATED"
+    | "MANUAL_RESIGN"
+    | "TIME_FORFEIT"
+    | "CHECKMATE"
+    | "STALEMATE"
+    | "DRAW_INSUFFICIENT"
+    | "DRAW_REPETITION"
+    | "DRAW_FIFTY"
+    | "DRAW";
+  /** Real board result for true terminations (checkmate, stalemate, draws, time forfeit). */
+  game_result?: "1-0" | "0-1" | "1/2-1/2" | null;
+  engine_id?: string | null;
+  tutor_eval_cp?: number | null;
+  kibitzer_eval_cp?: number | null;
+  engine_eval_cp?: number | null;
+  final_eval_override?: string | null;
+  player_acpl?: number | null;
+  engine_acpl?: number | null;
+  kibitzer_lines?: Array<{
+    ply: number;
+    fen: string;
+    engine: string;
+    pgn_fragment: string;
+    eval_data?: string | null;
+    trigger_source?: string;
+    logged_by?: string;
+    was_played?: number | null;
+  }>;
+  tutor_events?: Array<{
+    ply: number;
+    fen: string;
+    flag_type: string;
+    engine: string;
+    centipawn_data?: string | null;
+    suggested_variations?: string | null;
+    tutor_outcome?: string | null;
+    trigger_source?: string;
+  }>;
+}
+
+export interface TelemetryFlushResponse {
+  success: boolean;
+  discarded?: boolean;
+  reason?: string;
+  ply_count?: number;
+  game_id: string;
+  result: "1-0" | "0-1" | "1/2-1/2" | "*";
+  user_eval: number;
+  final_eval?: string | null;
+  eval_source: string;
+  data_tier?: "Silver" | "Gold" | null;
+}
+
+export const flushGameTelemetry = async (
+  payload: TelemetryFlushPayload
+): Promise<TelemetryFlushResponse> => {
+  const res = await fetch(`${API_BASE}/companion/sparring/telemetry-flush`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to flush game telemetry");
+  return res.json();
+};
+
+// -----------------------------------------------------------------------------
+// DSD-53: 3-Stream Engine Logs & Handshake Client
+// -----------------------------------------------------------------------------
+
+export interface EngineLogsResponse {
+  sparring?: string[];
+  kibitzer?: string[];
+  tutor?: string[];
+  subsystem?: string;
+  logs?: string[];
+  [key: string]: string | string[] | undefined;
+}
+
+export const fetchEngineLogs = async (subsystem?: string): Promise<EngineLogsResponse> => {
+  const url = new URL(`${API_BASE}/companion/engine-logs`);
+  if (subsystem) {
+    url.searchParams.set("subsystem", subsystem);
+  }
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error("Failed to fetch engine logs");
+  return res.json();
+};
+
+export const initEngineHandshake = async (payload: {
+  engine_id: string;
+  subsystem?: "sparring" | "kibitzer" | "tutor";
+  elo?: number;
+  threads?: number;
+  hash_mb?: number;
+  book_name?: string;
+  use_book?: boolean;
+  custom_options?: Record<string, any>;
+}): Promise<{ success: boolean; uci_log: string[]; error?: string | null }> => {
+  const res = await fetch(`${API_BASE}/companion/engine-handshake`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to initialize engine handshake");
+  return res.json();
+};
+
+
+// -----------------------------------------------------------------------------
+// Pass 2: Engine Role Slots, Hardware Parallel Analysis & Sparring DB Repair
+// -----------------------------------------------------------------------------
+
+export type EngineRoleName = "analyzer" | "sparring" | "kibitzer" | "tutor";
+export type AnalysisPresetKey = "quick" | "narrow" | "deep" | "thorough" | "custom";
+export type AnalyzerSearchMode = "depth" | "movetime" | "hybrid";
+export type WorkersMode = "auto" | "manual";
+
+export interface EngineRoleConfig {
+  engine_id: string;
+  uci_overrides: Record<string, any>;
+}
+
+export interface AnalyzerRoleConfig extends EngineRoleConfig {
+  preset: AnalysisPresetKey;
+  search_mode: AnalyzerSearchMode;
+  depth: number;
+  movetime_ms: number | null;
+  multipv: number;
+  workers_mode: WorkersMode;
+  manual_workers: number;
+  manual_threads: number;
+  is_neural_gpu?: boolean;
+}
+
+export interface HardwareProfile {
+  cpu_count: number;
+  safe_ceiling: number;
+  available_ram_mb: number;
+  default_auto_workers: number;
+}
+
+export interface AnalysisPresetDef {
+  label: string;
+  search_mode: AnalyzerSearchMode;
+  depth: number;
+  movetime_ms: number | null;
+}
+
+export interface EngineRolesResponse {
+  roles: {
+    analyzer: AnalyzerRoleConfig;
+    sparring: EngineRoleConfig;
+    kibitzer: EngineRoleConfig;
+    tutor: EngineRoleConfig;
+  };
+  hardware: HardwareProfile;
+  presets: Record<string, AnalysisPresetDef>;
+}
+
+export const fetchEngineRoles = async (): Promise<EngineRolesResponse> => {
+  const res = await fetch(`${API_BASE}/engine/roles`);
+  if (!res.ok) throw new Error("Failed to fetch engine roles");
+  return res.json();
+};
+
+export const updateEngineRole = async (
+  role: EngineRoleName,
+  payload: Partial<AnalyzerRoleConfig>
+): Promise<{
+  success: boolean;
+  role: EngineRoleName;
+  config: AnalyzerRoleConfig | EngineRoleConfig;
+  roles: EngineRolesResponse["roles"];
+  hardware: HardwareProfile;
+  presets: Record<string, AnalysisPresetDef>;
+}> => {
+  const res = await fetch(`${API_BASE}/engine/roles/${role}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to update ${role} role`);
+  }
+  return res.json();
+};
+
+export interface StartAnalysisJobPayload {
+  db_name?: string | null;
+  game_id?: number | string | null;
+  pgn?: string | null;
+  initial_fen?: string | null;
+  engine_id?: string;
+  preset?: AnalysisPresetKey;
+  search_mode?: AnalyzerSearchMode;
+  depth?: number;
+  movetime_ms?: number | null;
+  multipv?: number;
+  workers_mode?: WorkersMode;
+  manual_workers?: number;
+  manual_threads?: number;
+  uci_overrides?: Record<string, any>;
+}
+
+export interface AnalysisJobStatus {
+  job_id: string;
+  status: "running" | "completed" | "cancelled" | "error";
+  completed_plies: number;
+  total_plies: number;
+  move_count?: number;
+  worker_count: number;
+  threads_per_worker?: number;
+  engine_id: string;
+  engine_name: string;
+  preset?: AnalysisPresetKey;
+  depth?: number;
+  is_neural_gpu?: boolean;
+  hardware?: HardwareProfile;
+  error?: string | null;
+  result?: {
+    pgn: string;
+    annotations: any[];
+    stats: any;
+    eval_source: string;
+    final_eval: string;
+    tier: string;
+    persisted: boolean;
+    uci_log: string[];
+    worker_plan?: Record<string, any>;
+  } | null;
+}
+
+export const startParallelAnalysisJob = async (
+  payload: StartAnalysisJobPayload
+): Promise<AnalysisJobStatus> => {
+  const res = await fetch(`${API_BASE}/analysis/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to start parallel game analysis");
+  }
+  return res.json();
+};
+
+export const fetchParallelAnalysisJob = async (jobId: string): Promise<AnalysisJobStatus> => {
+  const res = await fetch(`${API_BASE}/analysis/jobs/${jobId}`);
+  if (!res.ok) throw new Error(`Failed to fetch analysis job ${jobId}`);
+  return res.json();
+};
+
+export const cancelParallelAnalysisJob = async (
+  jobId: string
+): Promise<{ success: boolean; status: string; job_id: string }> => {
+  const res = await fetch(`${API_BASE}/analysis/jobs/${jobId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`Failed to cancel analysis job ${jobId}`);
+  return res.json();
+};
+
+export interface RepairSparringResponse {
+  status: string;
+  database_name: string;
+  backfilled_rows: number;
+  repaired_engine_names: number;
+  downgraded_to_silver: number;
+  confirmed_gold: number;
+  confirmed_silver: number;
+  purged_empty_stubs: number;
+  audit_after?: any;
+}
+
+export const repairSparringDatabase = async (
+  dbName: string = "Sparring_Games.sqlite"
+): Promise<RepairSparringResponse> => {
+  const res = await fetch(`${API_BASE}/fitness/repair-sparring`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ db_name: dbName }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to repair sparring database");
+  }
   return res.json();
 };

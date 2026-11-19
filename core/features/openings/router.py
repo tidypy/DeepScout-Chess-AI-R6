@@ -1,10 +1,13 @@
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import os
+import sqlite3
 import chess
 from core.features.openings.fashion_service import OpeningFashionService
 from core.features.openings.opening_book_service import OpeningBookService
+from core.features.openings.polyglot_service import query_candidates
 
 router = APIRouter(prefix="/api/v1/openings", tags=["Opening Fashion & Polyglot Books"])
 
@@ -33,7 +36,7 @@ def get_fashion_service(db_name: Optional[str] = None) -> OpeningFashionService:
     return OpeningFashionService(db_path)
 
 @router.get("/fashion")
-async def get_fashion_index(
+def get_fashion_index(
     eco: Optional[str] = Query("B20"),
     system_name: Optional[str] = Query(None),
     time_range: str = Query("full"),
@@ -46,7 +49,7 @@ async def get_fashion_index(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/pioneer")
-async def get_opening_pioneer(
+def get_opening_pioneer(
     fen: Optional[str] = Query(None),
     db_name: Optional[str] = None,
 ):
@@ -61,7 +64,7 @@ async def get_opening_pioneer(
 # =========================================================================
 
 @router.get("/books/list")
-async def list_opening_books() -> List[Dict[str, Any]]:
+def list_opening_books() -> List[Dict[str, Any]]:
     """Lists all available built-in and user-imported Polyglot opening books."""
     try:
         return book_service.list_books()
@@ -69,7 +72,7 @@ async def list_opening_books() -> List[Dict[str, Any]]:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/books/active")
-async def get_active_opening_book() -> Dict[str, Any]:
+def get_active_opening_book() -> Dict[str, Any]:
     """Retrieves the currently active opening book."""
     try:
         return book_service.get_active_book()
@@ -77,7 +80,7 @@ async def get_active_opening_book() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/books/active")
-async def set_active_opening_book(req: SetActiveBookRequest) -> Dict[str, Any]:
+def set_active_opening_book(req: SetActiveBookRequest) -> Dict[str, Any]:
     """Sets the active opening book."""
     try:
         return book_service.set_active_book(req.book_name)
@@ -91,12 +94,12 @@ async def import_opening_book(file: UploadFile = File(...)) -> Dict[str, Any]:
     """Uploads and saves a Polyglot .bin opening book into user storage."""
     try:
         content = await file.read()
-        return book_service.import_book(file.filename or "custom_book.bin", content)
+        return await run_in_threadpool(book_service.import_book, file.filename or "custom_book.bin", content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import opening book: {str(e)}")
 
 @router.get("/books/probe")
-async def probe_opening_book(
+def probe_opening_book(
     fen: str = Query(..., description="Board FEN to probe"),
     book_name: Optional[str] = Query(None, description="Optional specific book name"),
 ) -> Dict[str, Any]:
@@ -109,3 +112,100 @@ async def probe_opening_book(
         return {"in_book": True, **res}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid FEN or probe failure: {str(e)}")
+
+# =========================================================================
+# DSD-46: SQLite Candidate Book Query
+# =========================================================================
+
+class BookCandidateResponse(BaseModel):
+    move_uci: str
+    move_san: Optional[str] = None
+    weight: int
+    popularity_pct: float
+    eval_cp: Optional[int] = None
+    acpl: Optional[int] = None
+    avg_elo: Optional[int] = None
+
+
+@router.get("/candidates", response_model=List[BookCandidateResponse])
+def get_book_candidates(
+    fen: str = Query(..., description="Board FEN to query (halfmove/fullmove stripped internally)"),
+    book_db: str = Query(..., description="Filename of the SQLite book database (in ROOT_DIR)"),
+) -> List[BookCandidateResponse]:
+    """Query the SQLite book_moves table for candidate moves at the given FEN.
+
+    Returns all matching moves ordered by weight, annotated with popularity
+    percentage computed as (move_weight / total_weight) * 100.
+    """
+    db_path = os.path.join(ROOT_DIR, book_db)
+    try:
+        candidates = query_candidates(db_path, fen)
+        return candidates
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Candidate query failed: {str(e)}")
+
+
+# =========================================================================
+# DSD-44: Non-Destructive Takeback & Repertoire Edge Ingestion
+# =========================================================================
+
+class SaveRepertoireEdgeRequest(BaseModel):
+    book_db: str
+    fen: str
+    move_uci: str
+    move_san: str
+    source: str = "USER"
+    is_provocation: bool = False
+    commentary: Optional[str] = None
+
+
+@router.post("/repertoire/edge")
+def save_repertoire_edge(req: SaveRepertoireEdgeRequest) -> Dict[str, Any]:
+    """Inserts or increments a repertoire candidate move edge in the specified SQLite book."""
+    try:
+        parts = req.fen.strip().split()
+        norm_fen = " ".join(parts[:4]) if len(parts) >= 4 else req.fen.strip()
+
+        db_path = req.book_db if os.path.isabs(req.book_db) else os.path.join(ROOT_DIR, req.book_db)
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+
+        conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA busy_timeout = 10000;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS book_moves (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    zobrist_key   TEXT,
+                    fen_normalized TEXT,
+                    move_uci      TEXT NOT NULL,
+                    move_san      TEXT,
+                    weight        INTEGER NOT NULL DEFAULT 0,
+                    eval_cp       INTEGER,
+                    acpl          INTEGER,
+                    avg_elo       INTEGER
+                );
+            """)
+            try:
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_fen_move ON book_moves(fen_normalized, move_uci);")
+                conn.execute("""
+                    INSERT INTO book_moves (fen_normalized, move_uci, move_san, weight)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT(fen_normalized, move_uci) DO UPDATE SET weight = weight + 1
+                """, (norm_fen, req.move_uci, req.move_san))
+            except sqlite3.OperationalError:
+                cur = conn.execute("SELECT id FROM book_moves WHERE fen_normalized = ? AND move_uci = ?", (norm_fen, req.move_uci))
+                row = cur.fetchone()
+                if row:
+                    conn.execute("UPDATE book_moves SET weight = weight + 1 WHERE id = ?", (row[0],))
+                else:
+                    conn.execute("INSERT INTO book_moves (fen_normalized, move_uci, move_san, weight) VALUES (?, ?, ?, 1)", (norm_fen, req.move_uci, req.move_san))
+            conn.commit()
+        finally:
+            conn.close()
+
+        return {"success": True, "message": "Edge saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save repertoire edge: {str(e)}")
+
+
